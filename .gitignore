@@ -1,11 +1,4 @@
 # Explicitly include essential project files
-!del_message_v3.py
-!README.md
-!readme.md
-!.env
-!.gitignore
-!env.template
-!requirements.txt
 
 
 .huskyrc.json
@@ -70,4 +63,12 @@ python-env-tools/**
 *.log
 *.txt
 *.csv
+
+!del_message_v3.py
+!README.md
+!readme.md
+!.env
+!.gitignore
+!env.template
+!requirements.txt
 !mailboxes.csv
