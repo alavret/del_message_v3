@@ -72,3 +72,4 @@ python-env-tools/**
 !env.template
 !requirements.txt
 !mailboxes.csv
+!message-ids.csv
