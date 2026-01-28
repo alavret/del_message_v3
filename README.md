@@ -115,7 +115,7 @@
         - В поле `Redirect URL` вводим `https://oauth.yandex.ru/verification_code`
         - В разделе "Почта для связи" указываем свой email.
           
-        <img src="images/create_oauth_app_00.jpg" width="800">
+        <img src="images/create_oauth_app_01.jpg" width="800">
         
     * Добавляем разрешения для токена. Для этого в разделе "Доступ к данным" ищем и добавляем следующие разрешения:
         | Имя разрешения | Что можно делать |
