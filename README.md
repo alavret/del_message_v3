@@ -237,13 +237,13 @@ pip install python-dotenv requests python-dateutil aioimaplib
 
 1. Запустите скрипт с аргументами:
    ```bash
-   python del_message_v3.py --id "<confidential@company.com>" --date "25-05-2024"
+   python del_message_v3.py
    ```
 
 2. В главном меню выберите `1`
 
 3. В меню параметров:
-   - Параметры уже заполнены из командной строки
+   - Выберите `1` - введите Message-ID: `<spam123@badsite.com>` и через пробел дату "01.06.25"
    - Выберите `4` - введите список ящиков: `boss@company.ru, cfo@company.ru, ceo@company.ru`
    - Выберите `9` - Delete messages WITHOUT using audit log
 
