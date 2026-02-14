@@ -1,6 +1,6 @@
 import argparse
 from dotenv import load_dotenv
-import requests
+import httpx
 import logging
 import logging.handlers as handlers
 import os.path
@@ -22,13 +22,13 @@ from typing import Optional
 import time
 import json
 import base64
-
+import traceback
 
 DEFAULT_IMAP_SERVER = "imap.yandex.ru"
 DEFAULT_IMAP_PORT = 993
 DEFAULT_360_API_URL = "https://api360.yandex.net"
 DEFAULT_OAUTH_API_URL = "https://oauth.yandex.ru/token"
-LOG_FILE = "delete_messages_v3.log"
+LOG_FILE = "imap_helper.log"
 DEFAULT_DAYS_DIF = 1
 FILTERED_EVENTS = ["message_receive"]
 FILTERED_MAILBOXES = []
@@ -69,6 +69,9 @@ NEEDED_PERMISSIONS = [
     "ya360_security:audit_log_mail"
 ]
 
+SERVICE_APP_PERMISSIONS = [
+    "mail:imap_full",
+]
 # Логирование
 logger = logging.getLogger("get_audit_log")
 logger.setLevel(logging.DEBUG)
@@ -89,6 +92,15 @@ IMAP_FETCH_RETRY_ATTEMPTS = 5
 
 
 def rate_limit_imap_commands():
+    """
+    Ограничивает частоту IMAP-команд для соблюдения лимита RPS.
+    
+    Функция проверяет время с последнего вызова и при необходимости
+    добавляет задержку для соблюдения ограничения RPS_LIMIT запросов в секунду.
+    
+    Returns:
+        None
+    """
     global _last_call_imap
     now = time.time()
     delta = now - _last_call_imap
@@ -97,6 +109,12 @@ def rate_limit_imap_commands():
     _last_call_imap = time.time()
 
 def arg_parser():
+    """
+    Создает парсер аргументов командной строки.
+    
+    Returns:
+        argparse.ArgumentParser: Настроенный парсер с параметрами --id и --date
+    """
     parser = argparse.ArgumentParser(
         description=dedent(
             """
@@ -149,6 +167,15 @@ def arg_parser():
     return parser
 
 def get_initials_config():
+    """
+    Инициализирует конфигурацию скрипта из аргументов командной строки и переменных окружения.
+    
+    Загружает настройки из .env файла и параметров командной строки,
+    проверяет обязательные параметры и формирует объект настроек.
+    
+    Returns:
+        SettingParams: Объект с настройками скрипта или завершает программу при ошибке
+    """
     parsr = arg_parser()
     try:
         args = parsr.parse_args()
@@ -192,23 +219,48 @@ def get_initials_config():
     return settings
 
 def FilterEvents(events: list) -> list:
+    """
+    Фильтрует события аудит-лога по типу события и почтовому ящику.
+    
+    Args:
+        events: Список событий для фильтрации
+        
+    Returns:
+        list: Отфильтрованный список событий, соответствующих FILTERED_EVENTS и FILTERED_MAILBOXES
+    """
     filtered_events = []
     for event in events:
         if event["eventType"] in FILTERED_EVENTS and event["userLogin"] in FILTERED_MAILBOXES:
             filtered_events.append(event)
     return filtered_events
 
-def get_all_api360_users(settings: "SettingParams", force = False):
-    if not force:
+def get_all_api360_users(settings: "SettingParams", force = False, suppress_messages = True):
+    """
+    Получает список всех пользователей организации с кэшированием.
+    
+    Использует кэш для минимизации запросов к API. Кэш обновляется при:
+    - Первом запросе
+    - Параметре force=True
+    - Истечении времени ALL_USERS_REFRESH_IN_MINUTES
+    
+    Args:
+        settings: Объект настроек с oauth_token и organization_id
+        force: Принудительное обновление кэша (по умолчанию False)
+        suppress_messages: Подавление информационных сообщений (по умолчанию True)
+        
+    Returns:
+        list: Список пользователей организации
+    """
+    if not force and not suppress_messages:
         logger.info("Получение всех пользователей организации из кэша...")
 
     if not settings.all_users or force or (datetime.now() - settings.all_users_get_timestamp).total_seconds() > ALL_USERS_REFRESH_IN_MINUTES * 60:
         #logger.info("Получение всех пользователей организации из API...")
-        settings.all_users = get_all_api360_users_from_api(settings)
+        settings.all_users = get_all_api360_users_from_api(settings, suppress_messages=suppress_messages)
         settings.all_users_get_timestamp = datetime.now()
     return settings.all_users
 
-def get_all_shared_mailboxes_cached(settings: "SettingParams", force = False):
+def get_all_shared_mailboxes_cached(settings: "SettingParams", force = False, suppress_messages = True):
     """
     Получает список всех общих почтовых ящиков с использованием кэша.
     
@@ -224,58 +276,73 @@ def get_all_shared_mailboxes_cached(settings: "SettingParams", force = False):
     Returns:
         list: Список объектов с полями resourceId и count
     """
-    if not force:
+    if not force and not suppress_messages:
         logger.info("Получение всех общих почтовых ящиков из кэша...")
 
     if not settings.all_shared_mailboxes or force or (datetime.now() - settings.all_shared_mailboxes_get_timestamp).total_seconds() > ALL_USERS_REFRESH_IN_MINUTES * 60:
-        settings.all_shared_mailboxes = get_all_shared_mailboxes_with_details(settings)
+        settings.all_shared_mailboxes = get_all_shared_mailboxes_with_details(settings, suppress_messages=suppress_messages)
         settings.all_shared_mailboxes_get_timestamp = datetime.now()
     return settings.all_shared_mailboxes
 
-def get_all_api360_users_from_api(settings: "SettingParams"):
-    logger.info("Получение всех пользователей организации из API...")
+def get_all_api360_users_from_api(settings: "SettingParams", suppress_messages = True):
+    """
+    Получает список всех пользователей организации напрямую из API Яндекс 360.
+    
+    Выполняет постраничный запрос к API для получения полного списка пользователей.
+    Исключает роботов и служебные аккаунты из результата.
+    
+    Args:
+        settings: Объект настроек с oauth_token и organization_id
+        suppress_messages: Подавление информационных сообщений (по умолчанию True)
+        
+    Returns:
+        list: Список пользователей организации или пустой список при ошибке
+    """
+    if not suppress_messages:
+        logger.info("Получение всех пользователей организации из API...")
     url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.organization_id}/users"
     headers = {"Authorization": f"OAuth {settings.oauth_token}"}
     has_errors = False
     users = []
     current_page = 1
     last_page = 1
-    while current_page <= last_page:
-        params = {'page': current_page, 'perPage': USERS_PER_PAGE_FROM_API}
-        try:
-            retries = 1
-            while True:
-                logger.debug(f"GET URL - {url}")
-                response = requests.get(url, headers=headers, params=params)
-                logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
-                if response.status_code != HTTPStatus.OK.value:
-                    logger.error(f"!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
-                    if retries < MAX_RETRIES:
-                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                        time.sleep(RETRIES_DELAY_SEC * retries)
-                        retries += 1
+    with httpx.Client(headers=headers) as client:
+        while current_page <= last_page:
+            params = {'page': current_page, 'perPage': USERS_PER_PAGE_FROM_API}
+            try:
+                retries = 1
+                while True:
+                    logger.debug(f"GET URL - {url}")
+                    response = client.get(url, params=params)
+                    logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
+                    if response.status_code != HTTPStatus.OK.value:
+                        logger.error(f"!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                        if retries < MAX_RETRIES:
+                            logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                            time.sleep(RETRIES_DELAY_SEC * retries)
+                            retries += 1
+                        else:
+                            has_errors = True
+                            break
                     else:
-                        has_errors = True
+                        for user in response.json()['users']:
+                            if not user.get('isRobot') and int(user["id"]) >= 1130000000000000:
+                                users.append(user)
+                        logger.debug(f"Загружено {len(response.json()['users'])} пользователей. Текущая страница - {current_page} (всего {last_page} страниц).")
+                        current_page += 1
+                        last_page = response.json()['pages']
                         break
-                else:
-                    for user in response.json()['users']:
-                        if not user.get('isRobot') and int(user["id"]) >= 1130000000000000:
-                            users.append(user)
-                    logger.debug(f"Загружено {len(response.json()['users'])} пользователей. Текущая страница - {current_page} (всего {last_page} страниц).")
-                    current_page += 1
-                    last_page = response.json()['pages']
-                    break
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
-            has_errors = True
-            break
+            except httpx.HTTPError as e:
+                logger.error(f"!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+                has_errors = True
+                break
 
-        if has_errors:
-            break
+            if has_errors:
+                break
 
     if has_errors:
-        print("Есть ошибки при GET запросах. Возвращается пустой список пользователей.")
+        logger.warning("Есть ошибки при GET запросах. Возвращается пустой список пользователей.")
         return []
     
     return users
@@ -308,27 +375,28 @@ def get_delegated_mailboxes(settings: "SettingParams", page: int = 1, per_page: 
     
     try:
         retries = 1
-        while True:
-            logger.debug(f"{thread_prefix}GET URL - {url}")
-            response = requests.get(url, headers=headers, params=params)
-            logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
-            
-            if response.status_code != HTTPStatus.OK.value:
-                logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
-                if retries < MAX_RETRIES:
-                    logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
-                    retries += 1
-                else:
-                    logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
-                    return None
-            else:
-                result = response.json()
-                logger.info(f"{thread_prefix}Успешно получено {len(result.get('resources', []))} делегированных ящиков. " 
-                           f"Страница {result.get('page', page)} из {result.get('total', 0) // result.get('perPage', per_page) + 1}")
-                return result
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"{thread_prefix}GET URL - {url}")
+                response = client.get(url, params=params)
+                logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
                 
-    except requests.exceptions.RequestException as e:
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
+                        return None
+                else:
+                    result = response.json()
+                    logger.info(f"{thread_prefix}Успешно получено {len(result.get('resources', []))} делегированных ящиков. " 
+                               f"Страница {result.get('page', page)} из {result.get('total', 0) // result.get('perPage', per_page) + 1}")
+                    return result
+                
+    except httpx.HTTPError as e:
         logger.error(f"{thread_prefix}!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return None
 
@@ -412,27 +480,28 @@ def enable_mailbox_delegation(settings: "SettingParams", resource_id: str, threa
     
     try:
         retries = 1
-        while True:
-            logger.debug(f"{thread_prefix}PUT URL - {url}")
-            logger.debug(f"{thread_prefix}Request body: {data}")
-            response = requests.put(url, headers=headers, json=data)
-            logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
-            
-            if response.status_code != HTTPStatus.OK.value:
-                logger.error(f"{thread_prefix}!!! ОШИБКА !!! при PUT запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
-                if retries < MAX_RETRIES:
-                    logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
-                    retries += 1
-                else:
-                    logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
-                    return None
-            else:
-                result = response.json()
-                logger.info(f"{thread_prefix}Успешно включено делегирование для ящика с resourceId={result.get('resourceId', resource_id)}")
-                return result
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"{thread_prefix}PUT URL - {url}")
+                logger.debug(f"{thread_prefix}Request body: {data}")
+                response = client.put(url, json=data)
+                logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
                 
-    except requests.exceptions.RequestException as e:
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"{thread_prefix}!!! ОШИБКА !!! при PUT запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
+                        return None
+                else:
+                    result = response.json()
+                    logger.info(f"{thread_prefix}Успешно включено делегирование для ящика с resourceId={result.get('resourceId', resource_id)}")
+                    return result
+                
+    except httpx.HTTPError as e:
         logger.error(f"{thread_prefix}!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return None
 
@@ -460,26 +529,27 @@ def disable_mailbox_delegation(settings: "SettingParams", resource_id: str, thre
     
     try:
         retries = 1
-        while True:
-            logger.debug(f"{thread_prefix}DELETE URL - {url}")
-            response = requests.delete(url, headers=headers)
-            logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
-            
-            if response.status_code != HTTPStatus.OK.value:
-                logger.error(f"{thread_prefix}!!! ОШИБКА !!! при DELETE запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
-                if retries < MAX_RETRIES:
-                    logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
-                    retries += 1
-                else:
-                    logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Ошибка выключения делегирования для ящика с resourceId={resource_id}")
-                    return False
-            else:
-                logger.debug(f"{thread_prefix}Успешно выключено делегирование для ящика с resourceId={resource_id}")
-                # API возвращает пустое тело при успешном выполнении
-                return True
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"{thread_prefix}DELETE URL - {url}")
+                response = client.delete(url)
+                logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
                 
-    except requests.exceptions.RequestException as e:
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"{thread_prefix}!!! ОШИБКА !!! при DELETE запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Ошибка выключения делегирования для ящика с resourceId={resource_id}")
+                        return False
+                else:
+                    logger.debug(f"{thread_prefix}Успешно выключено делегирование для ящика с resourceId={resource_id}")
+                    # API возвращает пустое тело при успешном выполнении
+                    return True
+                
+    except httpx.HTTPError as e:
         logger.error(f"{thread_prefix}!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return False
 
@@ -511,31 +581,32 @@ def get_shared_mailboxes(settings: "SettingParams", page: int = 1, per_page: int
     
     try:
         retries = 1
-        while True:
-            logger.debug(f"{thread_prefix}GET URL - {url}")
-            response = requests.get(url, headers=headers, params=params)
-            logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
-            
-            if response.status_code != HTTPStatus.OK.value:
-                logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
-                if retries < MAX_RETRIES:
-                    logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
-                    retries += 1
-                else:
-                    logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
-                    return None
-            else:
-                result = response.json()
-                logger.info(f"{thread_prefix}Успешно получено {len(result.get('resources', []))} общих ящиков. " 
-                           f"Страница {result.get('page', page)} из {result.get('total', 0) // result.get('perPage', per_page) + 1}")
-                return result
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"{thread_prefix}GET URL - {url}")
+                response = client.get(url, params=params)
+                logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
                 
-    except requests.exceptions.RequestException as e:
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
+                        return None
+                else:
+                    result = response.json()
+                    logger.info(f"{thread_prefix}Успешно получено {len(result.get('resources', []))} общих ящиков. " 
+                               f"Страница {result.get('page', page)} из {result.get('total', 0) // result.get('perPage', per_page) + 1}")
+                    return result
+                
+    except httpx.HTTPError as e:
         logger.error(f"{thread_prefix}!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return None
 
-def get_all_shared_mailboxes(settings: "SettingParams", per_page: int = 100, thread_id: int = 0):
+def get_all_shared_mailboxes(settings: "SettingParams", per_page: int = 100, thread_id: int = 0, suppress_messages = True):
     """
     Получает полный список всех общих почтовых ящиков в организации (все страницы).
     
@@ -551,7 +622,8 @@ def get_all_shared_mailboxes(settings: "SettingParams", per_page: int = 100, thr
     # Формируем префикс для логов
     thread_prefix = f"[THREAD #{thread_id}] " if thread_id > 0 else ""
     
-    logger.info(f"{thread_prefix}Получение полного списка всех общих ящиков...")
+    if not suppress_messages:
+        logger.info(f"{thread_prefix}Получение полного списка всех общих ящиков...")
     all_resources = []
     current_page = 1
     
@@ -578,7 +650,7 @@ def get_all_shared_mailboxes(settings: "SettingParams", per_page: int = 100, thr
     logger.info(f"{thread_prefix}Всего получено {len(all_resources)} общих ящиков")
     return all_resources
 
-def get_shared_mailbox_info(settings: "SettingParams", resource_id: str, thread_id: int = 0):
+def get_shared_mailbox_info(settings: "SettingParams", resource_id: str, thread_id: int = 0, suppress_messages = True):
     """
     Получает детальную информацию об общем почтовом ящике.
     
@@ -605,30 +677,31 @@ def get_shared_mailbox_info(settings: "SettingParams", resource_id: str, thread_
     
     try:
         retries = 1
-        while True:
-            logger.debug(f"{thread_prefix}GET URL - {url}")
-            response = requests.get(url, headers=headers)
-            logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
-            
-            if response.status_code != HTTPStatus.OK.value:
-                logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
-                if retries < MAX_RETRIES:
-                    logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
-                    retries += 1
-                else:
-                    logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
-                    return None
-            else:
-                result = response.json()
-                logger.debug(f"{thread_prefix}Успешно получена информация об общем ящике: email={result.get('email', 'N/A')}, name={result.get('name', 'N/A')}")
-                return result
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"{thread_prefix}GET URL - {url}")
+                response = client.get(url)
+                logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
                 
-    except requests.exceptions.RequestException as e:
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
+                        return None
+                else:
+                    result = response.json()
+                    logger.debug(f"{thread_prefix}Успешно получена информация об общем ящике: email={result.get('email', 'N/A')}, name={result.get('name', 'N/A')}")
+                    return result
+                
+    except httpx.HTTPError as e:
         logger.error(f"{thread_prefix}!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return None
 
-def get_all_shared_mailboxes_with_details(settings: "SettingParams", per_page: int = 100, thread_id: int = 0):
+def get_all_shared_mailboxes_with_details(settings: "SettingParams", per_page: int = 100, thread_id: int = 0, suppress_messages = True):
     """
     Получает полный список всех общих почтовых ящиков в организации с детальной информацией.
     Сначала получает список resourceId через ListShared, затем для каждого получает детали через GetShared.
@@ -651,16 +724,18 @@ def get_all_shared_mailboxes_with_details(settings: "SettingParams", per_page: i
     # Формируем префикс для логов
     thread_prefix = f"[THREAD #{thread_id}] " if thread_id > 0 else ""
     
-    logger.info(f"{thread_prefix}Получение полного списка общих ящиков с детальной информацией...")
+    if not suppress_messages:
+        logger.info(f"{thread_prefix}Получение полного списка общих ящиков с детальной информацией...")
     
     # Шаг 1: Получаем список resourceId
-    shared_mailboxes_list = get_all_shared_mailboxes(settings, per_page=per_page, thread_id=thread_id)
+    shared_mailboxes_list = get_all_shared_mailboxes(settings, per_page=per_page, thread_id=thread_id, suppress_messages=suppress_messages)
     
     if not shared_mailboxes_list:
         logger.warning(f"{thread_prefix}Не найдено общих ящиков или произошла ошибка при получении списка.")
         return []
     
-    logger.info(f"{thread_prefix}Получено {len(shared_mailboxes_list)} общих ящиков. Запрашиваем детальную информацию параллельно (max {MAX_PARALLEL_THREADS_SHARED} потоков)...")
+    if not suppress_messages:
+        logger.info(f"{thread_prefix}Получено {len(shared_mailboxes_list)} общих ящиков. Запрашиваем детальную информацию параллельно (max {MAX_PARALLEL_THREADS_SHARED} потоков)...")
     
     # Шаг 2: Для каждого resourceId получаем детальную информацию параллельно
     detailed_mailboxes = []
@@ -675,7 +750,7 @@ def get_all_shared_mailboxes_with_details(settings: "SettingParams", per_page: i
         
         logger.debug(f"{thread_prefix}Получение информации для ящика {index}/{len(shared_mailboxes_list)}, resourceId={resource_id}")
         
-        mailbox_info = get_shared_mailbox_info(settings, resource_id=resource_id, thread_id=thread_id)
+        mailbox_info = get_shared_mailbox_info(settings, resource_id=resource_id, thread_id=thread_id, suppress_messages=suppress_messages)
         
         if mailbox_info:
             # Добавляем count из первого запроса, если его нет в детальной информации
@@ -724,29 +799,30 @@ def get_mailbox_actors(settings: "SettingParams", resource_id: str, thread_id: i
     
     try:
         retries = 1
-        while True:
-            logger.debug(f"{thread_prefix}GET URL - {url}")
-            response = requests.get(url, headers=headers)
-            logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
-            
-            if response.status_code != HTTPStatus.OK.value:
-                logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
-                if retries < MAX_RETRIES:
-                    logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
-                    retries += 1
-                else:
-                    logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
-                    return None
-            else:
-                result = response.json()
-                actors = result.get('actors', [])
-                logger.info(f"{thread_prefix}Успешно получено {len(actors)} сотрудников с доступом к ящику resourceId={resource_id}")
-                for actor in actors:
-                    logger.debug(f"{thread_prefix}  - actorId: {actor.get('actorId', 'N/A')}, roles: {', '.join(actor.get('roles', []))}")
-                return actors
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"{thread_prefix}GET URL - {url}")
+                response = client.get(url)
+                logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
                 
-    except requests.exceptions.RequestException as e:
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
+                        return None
+                else:
+                    result = response.json()
+                    actors = result.get('actors', [])
+                    logger.info(f"{thread_prefix}Успешно получено {len(actors)} сотрудников с доступом к ящику resourceId={resource_id}")
+                    for actor in actors:
+                        logger.debug(f"{thread_prefix}  - actorId: {actor.get('actorId', 'N/A')}, roles: {', '.join(actor.get('roles', []))}")
+                    return actors
+                
+    except httpx.HTTPError as e:
         logger.error(f"{thread_prefix}!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return None
 
@@ -822,34 +898,35 @@ def set_mailbox_permissions(settings: "SettingParams", resource_id: str, actor_i
     
     try:
         retries = 1
-        while True:
-            logger.debug(f"{thread_prefix}POST URL - {url}")
-            logger.debug(f"{thread_prefix}Query params: {params}")
-            logger.debug(f"{thread_prefix}Request body: {data}")
-            response = requests.post(url, headers=headers, params=params, json=data)
-            logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
-            
-            if response.status_code != HTTPStatus.OK.value:
-                logger.error(f"{thread_prefix}!!! ОШИБКА !!! при POST запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
-                if retries < MAX_RETRIES:
-                    logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
-                    retries += 1
-                else:
-                    logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
-                    return None
-            else:
-                result = response.json()
-                task_id = result.get('taskId')
-                logger.info(f"{thread_prefix}Успешно инициирована задача на установку прав. taskId={task_id}")
-                logger.debug(f"{thread_prefix}Используйте taskId {task_id} для проверки статуса выполнения задачи")
-                return task_id
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"{thread_prefix}POST URL - {url}")
+                logger.debug(f"{thread_prefix}Query params: {params}")
+                logger.debug(f"{thread_prefix}Request body: {data}")
+                response = client.post(url, params=params, json=data)
+                logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
                 
-    except requests.exceptions.RequestException as e:
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"{thread_prefix}!!! ОШИБКА !!! при POST запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
+                        return None
+                else:
+                    result = response.json()
+                    task_id = result.get('taskId')
+                    logger.info(f"{thread_prefix}Успешно инициирована задача на установку прав. taskId={task_id}")
+                    logger.debug(f"{thread_prefix}Используйте taskId {task_id} для проверки статуса выполнения задачи")
+                    return task_id
+                
+    except httpx.HTTPError as e:
         logger.error(f"{thread_prefix}!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return None
 
-def check_mailbox_task_status(settings: "SettingParams", task_id: str, thread_id: int = 0):
+async def check_mailbox_task_status(settings: "SettingParams", task_id: str, thread_id: int = 0):
     """
     Проверяет статус выполнения задачи на изменение прав доступа к почтовому ящику.
     Спецификация API: https://yandex.ru/dev/api360/doc/ru/ref/MailboxService/MailboxService_TaskStatus
@@ -878,16 +955,15 @@ def check_mailbox_task_status(settings: "SettingParams", task_id: str, thread_id
         
         if task_id:
             # Проверяем статус сразу
-            status_info = check_mailbox_task_status(settings, task_id)
+            status_info = await check_mailbox_task_status(settings, task_id)
             
             # Ожидаем выполнения задачи (с повторными проверками)
-            import time
             max_attempts = 10
             for attempt in range(max_attempts):
-                status_info = check_mailbox_task_status(settings, task_id)
+                status_info = await check_mailbox_task_status(settings, task_id)
                 if status_info and status_info.get('status') in ['complete', 'error']:
                     break
-                time.sleep(2)  # Ждем 2 секунды перед следующей проверкой
+                await asyncio.sleep(2)  # Ждем 2 секунды перед следующей проверкой
     """
     # Формируем префикс для логов
     thread_prefix = f"[THREAD #{thread_id}] " if thread_id > 0 else ""
@@ -900,39 +976,40 @@ def check_mailbox_task_status(settings: "SettingParams", task_id: str, thread_id
     
     try:
         retries = 1
-        while True:
-            logger.debug(f"{thread_prefix}GET URL - {url}")
-            response = requests.get(url, headers=headers)
-            logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
-            
-            if response.status_code != HTTPStatus.OK.value:
-                logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
-                if retries < MAX_RETRIES:
-                    logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
-                    retries += 1
+        async with httpx.AsyncClient(headers=headers) as client:
+            while True:
+                logger.debug(f"{thread_prefix}GET URL - {url}")
+                response = await client.get(url)
+                logger.debug(f"{thread_prefix}x-request-id: {response.headers.get('x-request-id','')}")
+                
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"{thread_prefix}!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"{thread_prefix}Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        await asyncio.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
+                        return None
                 else:
-                    logger.error(f"{thread_prefix}Превышено максимальное количество попыток. Возвращается None.")
-                    return None
-            else:
-                result = response.json()
-                status = result.get('status', 'unknown')
-                logger.info(f"{thread_prefix}Статус задачи taskId={task_id}: {status}")
-                
-                if status == "complete":
-                    logger.info(f"{thread_prefix}Задача успешно выполнена, права изменены")
-                elif status == "error":
-                    logger.error(f"{thread_prefix}Задача завершилась с ошибкой")
-                elif status == "running":
-                    logger.info(f"{thread_prefix}Задача выполняется...")
+                    result = response.json()
+                    status = result.get('status', 'unknown')
+                    logger.info(f"{thread_prefix}Статус задачи taskId={task_id}: {status}")
                     
-                return result
+                    if status == "complete":
+                        logger.info(f"{thread_prefix}Задача успешно выполнена, права изменены")
+                    elif status == "error":
+                        logger.error(f"{thread_prefix}Задача завершилась с ошибкой")
+                    elif status == "running":
+                        logger.info(f"{thread_prefix}Задача выполняется...")
+                        
+                    return result
                 
-    except requests.exceptions.RequestException as e:
+    except httpx.HTTPError as e:
         logger.error(f"{thread_prefix}!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         return None
 
-async def wait_for_task_completion(settings: "SettingParams", task_id: str, max_attempts: int = 30, delay_seconds: int = 2, thread_id: int = 0):
+async def wait_for_task_completion(settings: "SettingParams", task_id: str, max_attempts: int = 5, delay_seconds: int = 2, thread_id: int = 0):
     """
     Асинхронно ожидает завершения задачи на изменение прав доступа к почтовому ящику.
     
@@ -953,7 +1030,7 @@ async def wait_for_task_completion(settings: "SettingParams", task_id: str, max_
     logger.info(f"{thread_prefix}Ожидание завершения задачи taskId={task_id}...")
     
     for attempt in range(1, max_attempts + 1):
-        status_info = check_mailbox_task_status(settings, task_id, thread_id)
+        status_info = await check_mailbox_task_status(settings, task_id, thread_id)
         
         if status_info is None:
             logger.error(f"{thread_prefix}Ошибка при проверке статуса задачи (попытка {attempt}/{max_attempts})")
@@ -1032,6 +1109,8 @@ def get_resource_id_by_email(settings: "SettingParams", all_users: list, all_sha
         
     Returns:
         dict: Информация о пользователе (включая id)
+        resource_type: Тип ресурса (user, shared_mailbox)
+        isEnabled: Флаг, указывающий, является ли пользователь включенным
         None: в случае ошибки или если пользователь не найден
     """
     logger.debug(f"{thread_prefix}Поиск ресурса с email={email}...")
@@ -1048,68 +1127,130 @@ def get_resource_id_by_email(settings: "SettingParams", all_users: list, all_sha
     
     if not all_users and not all_shared_mailboxes:
         logger.error(f"{thread_prefix}Список всех ресурсов пуст. Выход из функции.")
-        return resource_id, resource_type
-    
-    user_ids = [user["id"] for user in all_users if user.get('nickname', '').lower() == alias]
-    shared_mailbox_ids = [shared["id"] for shared in all_shared_mailboxes if shared.get('email', '').split('@')[0].lower() == alias]
-    resource_id = (user_ids + shared_mailbox_ids)[0]
-    if len(user_ids) > 0:
-        resource_type = "user"
-    elif len(shared_mailbox_ids) > 0:
-        resource_type = "shared_mailbox"
-    else:
-        resource_type = None
-        resource_id = None
+        return None, None, False
 
-    return resource_id, resource_type
+    resource_type = None
+    resource_id = None
+    isEnabled = True
+    for user in all_users:
+        if user.get('nickname', '').lower() == alias or any(a.lower() == alias for a in user.get('aliases', [])):
+            resource_id = user["id"]
+            resource_type = "user"
+            isEnabled = user["isEnabled"]
+            break
+    for shared in all_shared_mailboxes:
+        if shared.get('email', '').split('@')[0].lower() == alias:
+            resource_id = shared["id"]
+            resource_type = "shared_mailbox"
+            break
+
+    return resource_id, resource_type, isEnabled
     
 async def reconnect_imap_session(
-    username: str, app_password: str, folder: str, thread_prefix: str = ""
+    settings: "SettingParams", folder: str = None, thread_prefix: str = "", username: str = None, mode: str = "delegate"
 ) -> aioimaplib.IMAP4_SSL:
     """
-    Переподключение к IMAP с повторным выбором папки.
+    Создает новое IMAP-соединение с авторизацией и выбором папки.
+    
+    Args:
+        settings: Объект настроек с параметрами подключения
+        folder: Имя папки для SELECT после подключения (опционально)
+        thread_prefix: Префикс для логирования
+        username: Имя пользователя для авторизации
+        mode: Режим авторизации ("delegate" - пароль, "service_application" - OAuth)
+        
+    Returns:
+        aioimaplib.IMAP4_SSL: Новое IMAP-соединение
+        
+    Raises:
+        Exception: При ошибке подключения или авторизации
     """
-    logger.warning(f"{thread_prefix}↻ Переподключение к IMAP, папка {folder}...")
-    imap_connector = aioimaplib.IMAP4_SSL(
-        host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT
-    )
-    await imap_connector.wait_hello_from_server()
-    await imap_connector.login(username, app_password)
-    rate_limit_imap_commands()
-    await imap_connector.select(folder)
-    logger.info(f"{thread_prefix}✓ Переподключение выполнено")
-    return imap_connector
+    try:
+        if mode == "delegate":
+            imap_password = settings.delegate_password
+        elif mode == "service_application":
+            try:
+                imap_password = get_service_app_token(settings, username)
+            except Exception as e:
+                logger.error(f"{thread_prefix}Ошибка при получении service app token: {type(e).__name__}: {e}")
+                raise
+        else:
+            logger.error(f"{thread_prefix}Неизвестный режим работы: {mode}")
+            raise ValueError("Неизвестный режим работы")
+        
+        logger.warning(f"{thread_prefix}↻ Переподключение к IMAP...")
+        last_exc = None
+        imap_connector = None
+        for attempt in range(1, IMAP_FETCH_RETRY_ATTEMPTS + 1):
+            no_retry = False
+            try:
+                imap_connector = aioimaplib.IMAP4_SSL(
+                    host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT
+                )
+                await imap_connector.wait_hello_from_server()
+                if mode == "service_application":
+                    login_response = await imap_connector.xoauth2(user=username, token=imap_password)
+                else:
+                    login_response = await imap_connector.login(username, imap_password)
+                if login_response.result != 'OK':
+                    response_text = str(login_response.lines)
+                    is_server_error = 'UNAVAILABLE' in response_text or 'internal server error' in response_text.lower()
+                    no_retry = login_response.result == 'NO' and not is_server_error
+                    raise Exception(
+                        f"LOGIN вернул {login_response.result}: {login_response.lines}"
+                    )
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                imap_connector = None
+                if no_retry:
+                    logger.error(
+                        f"{thread_prefix}LOGIN отклонён сервером (NO), повторные попытки не выполняются: {e}"
+                    )
+                    raise
+                logger.warning(
+                    f"{thread_prefix}LOGIN попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} завершилась ошибкой: {type(e).__name__}: {e}"
+                )
+                await asyncio.sleep(0.5 * attempt)
+        else:
+            # Цикл завершился без break (не было no_retry raise) — проверяем результат
+            if last_exc or imap_connector is None:
+                logger.error(f"{thread_prefix}Ошибка при подключении или логине IMAP: {type(last_exc).__name__}: {last_exc}")
+                raise last_exc
 
+        if folder:
+            try:
+                rate_limit_imap_commands()
+                logger.warning(f"{thread_prefix}↻ SELECT папки {folder}...")
+                await imap_connector.select(folder)
+            except Exception as e:
+                logger.error(f"{thread_prefix}Ошибка при SELECT папки {folder}: {type(e).__name__}: {e}")
+                await imap_connector.logout()
+                raise
 
-async def connect_and_login_with_retry(
-    username: str, app_password: str, thread_prefix: str = ""
-) -> aioimaplib.IMAP4_SSL:
-    """
-    Подключение и LOGIN с повторными попытками.
-    """
-    last_exc = None
+        logger.info(f"{thread_prefix}✓ Переподключение выполнено")
+        return imap_connector
 
-    for attempt in range(1, IMAP_FETCH_RETRY_ATTEMPTS + 1):
-        try:
-            imap_connector = aioimaplib.IMAP4_SSL(
-                host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT
-            )
-            await imap_connector.wait_hello_from_server()
-            await imap_connector.login(username, app_password)
-            return imap_connector
-        except Exception as e:
-            last_exc = e
-            logger.warning(
-                f"{thread_prefix}LOGIN попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} завершилась ошибкой: {type(e).__name__}: {e}"
-            )
-            await asyncio.sleep(0.5 * attempt)
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("Не удалось подключиться к IMAP после переподключений")
+    except Exception as e:
+        err_str = str(e)
+        if 'FORBIDDEN' in err_str or 'AUTHENTICATIONFAILED' in err_str:
+            logger.error(f"{thread_prefix}Ошибка переподключения к IMAP (доступ запрещён): {e}")
+        else:
+            logger.exception(f"{thread_prefix}Ошибка переподключения к IMAP: {type(e).__name__}: {e}")
+        raise
 
 
 def quote_imap_string(value: str) -> str:
+    """
+    Оборачивает строку в двойные кавычки для использования в IMAP-командах.
+    
+    Args:
+        value: Строка для обработки
+        
+    Returns:
+        str: Строка в двойных кавычках или пустые кавычки для пустой строки
+    """
     if not value:
         return '""'
     if value.startswith('"') and value.endswith('"'):
@@ -1118,6 +1259,15 @@ def quote_imap_string(value: str) -> str:
 
 
 def imap_utf7_decode(value: str) -> str:
+    """
+    Декодирует строку из модифицированного UTF-7 формата IMAP в Unicode.
+    
+    Args:
+        value: Строка в IMAP UTF-7 формате
+        
+    Returns:
+        str: Декодированная Unicode строка
+    """
     if not value or "&" not in value:
         return value
     result = []
@@ -1149,6 +1299,15 @@ def imap_utf7_decode(value: str) -> str:
 
 
 def imap_utf7_encode(value: str) -> str:
+    """
+    Кодирует Unicode строку в модифицированный UTF-7 формат IMAP.
+    
+    Args:
+        value: Unicode строка для кодирования
+        
+    Returns:
+        str: Строка в IMAP UTF-7 формате
+    """
     if value is None:
         return ""
     result = []
@@ -1177,6 +1336,16 @@ def imap_utf7_encode(value: str) -> str:
 
 
 def parse_imap_list_line(folder_line: Optional[bytes]) -> Optional[dict]:
+    """
+    Парсит строку ответа IMAP LIST команды.
+    
+    Args:
+        folder_line: Байтовая строка ответа IMAP LIST
+        
+    Returns:
+        dict: Словарь с полями flags, delimiter, mailbox, mailbox_display
+        None: При невалидной строке или ошибке парсинга
+    """
     if not folder_line or folder_line == b"LIST Completed.":
         return None
     try:
@@ -1207,13 +1376,29 @@ def parse_imap_list_line(folder_line: Optional[bytes]) -> Optional[dict]:
 async def list_folders_with_retry(
     imap_connector,
     username: str,
-    app_password: str,
     reference: str = '""',
     pattern: str = "*",
     thread_prefix: str = "",
+    settings: "SettingParams" = None,
+    mode: str = "delegate",
 ):
     """
-    LIST с повторными попытками и переподключением IMAP.
+    Выполняет IMAP LIST команду с повторными попытками и автоматическим переподключением.
+    
+    Args:
+        imap_connector: IMAP-соединение
+        username: Имя пользователя для переподключения
+        reference: Базовая директория для LIST (по умолчанию '""')
+        pattern: Шаблон поиска папок (по умолчанию "*")
+        thread_prefix: Префикс для логирования
+        settings: Объект настроек
+        mode: Режим работы ("delegate" или "service_application")
+        
+    Returns:
+        tuple: (ответ LIST, обновленный imap_connector)
+        
+    Raises:
+        RuntimeError: При невозможности выполнить LIST после всех попыток
     """
     last_exc = None
 
@@ -1236,7 +1421,7 @@ async def list_folders_with_retry(
 
         try:
             imap_connector = await reconnect_imap_session(
-                username, app_password, "INBOX", thread_prefix
+                settings, "INBOX", thread_prefix, username, mode = mode   
             )
         except Exception as reconnect_error:
             last_exc = reconnect_error
@@ -1256,11 +1441,25 @@ async def list_folders_with_retry(
 async def list_all_folders_recursive(
     imap_connector,
     username: str,
-    app_password: str,
     thread_prefix: str = "",
+    settings: "SettingParams" = None,
+    mode: str = "delegate",
 ):
     """
     Рекурсивно получает список всех папок почтового ящика.
+    
+    Обходит иерархию папок и возвращает список всех доступных папок,
+    исключая папки с флагом \\Noselect.
+    
+    Args:
+        imap_connector: IMAP-соединение
+        username: Имя пользователя
+        thread_prefix: Префикс для логирования
+        settings: Объект настроек
+        mode: Режим работы ("delegate" или "service_application")
+        
+    Returns:
+        tuple: (список папок в кавычках, обновленный imap_connector)
     """
     folders = []
     folders_set = set()
@@ -1278,10 +1477,11 @@ async def list_all_folders_recursive(
         (status, list_lines), imap_connector = await list_folders_with_retry(
             imap_connector=imap_connector,
             username=username,
-            app_password=app_password,
             reference='""',
             pattern=quote_imap_string(pattern),
             thread_prefix=thread_prefix,
+            settings=settings,
+            mode=mode,
         )
         if status != "OK":
             continue
@@ -1312,13 +1512,32 @@ async def list_all_folders_recursive(
 async def fetch_message_headers_with_retry(
     imap_connector,
     username: str,
-    app_password: str,
     folder: str,
     msg_num: int,
     thread_prefix: str = "",
+    settings: "SettingParams" = None,
+    mode: str = "delegate",
 ):
     """
-    Выполняет FETCH с повторными попытками и переподключением сессии IMAP.
+    Получает заголовки сообщения через IMAP FETCH с повторными попытками.
+    
+    Запрашивает UID, FLAGS и основные заголовки сообщения (Message-ID, From, To и др.).
+    При ошибке выполняет переподключение и повторные попытки.
+    
+    Args:
+        imap_connector: IMAP-соединение
+        username: Имя пользователя для переподключения
+        folder: Имя папки для SELECT при переподключении
+        msg_num: Порядковый номер сообщения
+        thread_prefix: Префикс для логирования
+        settings: Объект настроек
+        mode: Режим работы ("delegate" или "service_application")
+        
+    Returns:
+        tuple: (ответ FETCH, обновленный imap_connector)
+        
+    Raises:
+        RuntimeError: При невозможности выполнить FETCH после всех попыток
     """
     last_exc = None
     fetch_cmd = "(UID FLAGS BODY.PEEK[HEADER.FIELDS (%s)])" % " ".join(ID_HEADER_SET)
@@ -1340,7 +1559,7 @@ async def fetch_message_headers_with_retry(
 
         try:
             imap_connector = await reconnect_imap_session(
-                username, app_password, folder, thread_prefix
+                settings, folder, thread_prefix, username, mode
             )
         except Exception as reconnect_error:
             last_exc = reconnect_error
@@ -1360,13 +1579,29 @@ async def fetch_message_headers_with_retry(
 async def store_message_with_retry(
     imap_connector,
     username: str,
-    app_password: str,
     folder: str,
     msg_num: int,
     thread_prefix: str = "",
+    settings: "SettingParams" = None,
+    mode: str = "delegate",
 ):
     """
-    STORE с повторными попытками и переподключением IMAP.
+    Помечает сообщение флагом \\Deleted через IMAP STORE с повторными попытками.
+    
+    Args:
+        imap_connector: IMAP-соединение
+        username: Имя пользователя для переподключения
+        folder: Имя папки для SELECT при переподключении
+        msg_num: Порядковый номер сообщения
+        thread_prefix: Префикс для логирования
+        settings: Объект настроек
+        mode: Режим работы ("delegate" или "service_application")
+        
+    Returns:
+        tuple: (ответ STORE, обновленный imap_connector)
+        
+    Raises:
+        RuntimeError: При невозможности выполнить STORE после всех попыток
     """
     last_exc = None
 
@@ -1390,7 +1625,7 @@ async def store_message_with_retry(
 
         try:
             imap_connector = await reconnect_imap_session(
-                username, app_password, folder, thread_prefix
+                settings, folder, thread_prefix, username, mode
             )
         except Exception as reconnect_error:
             last_exc = reconnect_error
@@ -1410,12 +1645,27 @@ async def store_message_with_retry(
 async def select_folder_with_retry(
     imap_connector,
     username: str,
-    app_password: str,
     folder: str,
     thread_prefix: str = "",
+    settings: "SettingParams" = None,
+    mode: str = "delegate",
 ):
     """
-    SELECT с повторными попытками и переподключением IMAP.
+    Выполняет IMAP SELECT команду для выбора папки с повторными попытками.
+    
+    Args:
+        imap_connector: IMAP-соединение
+        username: Имя пользователя для переподключения
+        folder: Имя папки для выбора
+        thread_prefix: Префикс для логирования
+        settings: Объект настроек
+        mode: Режим работы ("delegate" или "service_application")
+        
+    Returns:
+        tuple: (ответ SELECT, обновленный imap_connector)
+        
+    Raises:
+        RuntimeError: При невозможности выполнить SELECT после всех попыток
     """
     last_exc = None
 
@@ -1439,7 +1689,7 @@ async def select_folder_with_retry(
 
         try:
             imap_connector = await reconnect_imap_session(
-                username, app_password, folder, thread_prefix
+                settings, folder, thread_prefix, username, mode
             )
         except Exception as reconnect_error:
             last_exc = reconnect_error
@@ -1459,13 +1709,29 @@ async def select_folder_with_retry(
 async def search_with_retry(
     imap_connector,
     username: str,
-    app_password: str,
     folder: str,
     search_criteria: str,
     thread_prefix: str = "",
-):
+    settings: "SettingParams" = None,
+    mode: str = "delegate",
+    ):
     """
-    SEARCH с повторными попытками и переподключением IMAP.
+    Выполняет IMAP SEARCH команду с повторными попытками и переподключением.
+    
+    Args:
+        imap_connector: IMAP-соединение
+        username: Имя пользователя для переподключения
+        folder: Имя папки для SELECT при переподключении
+        search_criteria: Критерии поиска IMAP (например, "SINCE 01-Jan-2024")
+        thread_prefix: Префикс для логирования
+        settings: Объект настроек
+        mode: Режим работы ("delegate" или "service_application")
+        
+    Returns:
+        tuple: (ответ SEARCH, обновленный imap_connector)
+        
+    Raises:
+        RuntimeError: При невозможности выполнить SEARCH после всех попыток
     """
     last_exc = None
 
@@ -1486,7 +1752,7 @@ async def search_with_retry(
 
         try:
             imap_connector = await reconnect_imap_session(
-                username, app_password, folder, thread_prefix
+                settings, folder, thread_prefix, username, mode
             )
         except Exception as reconnect_error:
             last_exc = reconnect_error
@@ -1507,7 +1773,7 @@ async def delete_messages_via_imap_basic_auth(
     delegate_alias: str,
     delegated_mailbox_alias: str,
     org_domain: str,
-    app_password: str,
+    mode: str,
     messages_to_delete: list,
     settings: "SettingParams",
     thread_id: int = 0
@@ -1519,7 +1785,7 @@ async def delete_messages_via_imap_basic_auth(
         delegate_alias: Логин делегата на Яндексе (например, "i.petrov")
         delegated_mailbox_alias: Имя делегированного ящика (например, "office")
         org_domain: Домен организации (например, "example.ru")
-        app_password: Пароль приложения для делегата
+        mode: Режим работы для ящика (delegate, service_application, skip)
         messages_to_delete: Список словарей с информацией о сообщениях для удаления.
             Каждый словарь должен содержать:
             - message_id: идентификатор сообщения
@@ -1534,27 +1800,34 @@ async def delete_messages_via_imap_basic_auth(
     # Формируем префикс для логов
     thread_prefix = f"[THREAD #{thread_id}] " if thread_id > 0 else ""
     
-    # Формируем имя пользователя в формате: домен/логин_делегата/имя_ящика
-    username = f"{org_domain}/{delegate_alias}/{delegated_mailbox_alias}"
+    if mode == "delegate":
+        # Формируем имя пользователя в формате: домен/логин_делегата/имя_ящика
+        username = f"{org_domain}/{delegate_alias}/{delegated_mailbox_alias}"
+    elif mode == "service_application":
+        username = f"{delegated_mailbox_alias}@{org_domain}"
+    else:
+        raise ValueError("Неизвестный режим работы")
+    
     logger.info(f"{thread_prefix}Подключение к IMAP для удаления сообщений. Пользователь: {username}")
     
     results = {}
     
+    # Подключаемся к IMAP серверу (вне try/except — если логин не удался,
+    # исключение должно всплыть к вызывающему коду)
+    logger.debug(f"{thread_prefix}Авторизация для пользователя {username}...")
+    imap_connector = await reconnect_imap_session(
+        username=username, settings=settings, thread_prefix=thread_prefix, mode=mode
+    )
+    logger.info(f"{thread_prefix}Успешная авторизация для {username}")
+    
     try:
-        # Подключаемся к IMAP серверу
-        # Авторизация через basic auth (login/password)
-        logger.debug(f"{thread_prefix}Авторизация для пользователя {username}...")
-        imap_connector = await connect_and_login_with_retry(
-            username=username, app_password=app_password, thread_prefix=thread_prefix
-        )
-        logger.info(f"{thread_prefix}Успешная авторизация для {username}")
-        
         # Рекурсивно получаем список папок
         folders, imap_connector = await list_all_folders_recursive(
             imap_connector=imap_connector,
             username=username,
-            app_password=app_password,
             thread_prefix=thread_prefix,
+            settings=settings,
+            mode=mode,
         )
         
         logger.debug(f"{thread_prefix}Найдено папок: {len(folders)}")
@@ -1566,9 +1839,10 @@ async def delete_messages_via_imap_basic_auth(
             _, imap_connector = await select_folder_with_retry(
                 imap_connector=imap_connector,
                 username=username,
-                app_password=app_password,
                 folder=folder,
                 thread_prefix=thread_prefix,
+                settings=settings,
+                mode=mode,
             )
             
             for msg in messages_to_delete:
@@ -1587,10 +1861,11 @@ async def delete_messages_via_imap_basic_auth(
                 response, imap_connector = await search_with_retry(
                     imap_connector=imap_connector,
                     username=username,
-                    app_password=app_password,
                     folder=folder,
                     search_criteria=search_criteria,
                     thread_prefix=thread_prefix,
+                    settings=settings,
+                    mode=mode,
                 )
                 
                 if response.result == 'OK':
@@ -1605,10 +1880,11 @@ async def delete_messages_via_imap_basic_auth(
                                     await fetch_message_headers_with_retry(
                                         imap_connector=imap_connector,
                                         username=username,
-                                        app_password=app_password,
                                         folder=folder,
                                         msg_num=int(num),
                                         thread_prefix=thread_prefix,
+                                        settings=settings,
+                                        mode=mode,
                                     )
                                 )
                                 
@@ -1654,10 +1930,11 @@ async def delete_messages_via_imap_basic_auth(
                                                     _, imap_connector = await store_message_with_retry(
                                                         imap_connector=imap_connector,
                                                         username=username,
-                                                        app_password=app_password,
                                                         folder=folder,
                                                         msg_num=int(num),
                                                         thread_prefix=thread_prefix,
+                                                        settings=settings,
+                                                        mode=mode,
                                                     )
                                                     # Инициализируем результат, если его еще нет
                                                     if message_id not in results:
@@ -2038,7 +2315,7 @@ def check_incomplete_sessions(settings: "SettingParams") -> bool:
             
             logger.info("="*80)
             logger.info("РЕЗУЛЬТАТЫ ВОССТАНОВЛЕНИЯ:")
-            logger.info(f"  Всего строк: {result['total']}")
+            logger.info(f"  Всего ящиков: {result['total']}")
             logger.info(f"  Обработано: {result['processed']}")
             logger.info(f"  Успешно: {result['success']}")
             logger.info(f"  Ошибок: {result['errors']}")
@@ -2157,7 +2434,7 @@ def compare_actors_lists(current_actors: list, target_actors: list):
     return current_set != target_set
 
 
-def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"):
+def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams", all_users: list = None):
     """
     Восстанавливает исходные разрешения для почтовых ящиков на основе различий между checkin и checkout.
     
@@ -2205,9 +2482,10 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
             "details": []
         }
     
-    all_users = get_all_api360_users(settings, force=False)
-    all_shared_mailboxes = get_all_shared_mailboxes_cached(settings, force=False)
     # Получаем список всех пользователей, если не передан
+    if not all_users:
+        all_users = get_all_api360_users(settings, force=False)
+    all_shared_mailboxes = get_all_shared_mailboxes_cached(settings, force=False)
     if not all_users and not all_shared_mailboxes:
         logger.error("Не удалось получить список пользователей и общих ящиков. Восстановление невозможно.")
         return {
@@ -2268,9 +2546,9 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
     
     logger.info(f"Обнаружено {len(mailbox_data)} почтовых ящиков для восстановления")
     
-    # Статистика
+    # Статистика (считаем по почтовым ящикам, не по строкам)
     stats = {
-        "total": len(missing_lines),
+        "total": len(mailbox_data),
         "processed": 0,
         "success": 0,
         "errors": 0,
@@ -2290,20 +2568,11 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
         }
         
         # Получаем информацию о пользователе (владельце ящика)
-        resource_id, resource_type = get_resource_id_by_email(settings, all_users, all_shared_mailboxes, mailbox_alias)
+        resource_id, resource_type, isEnabled = get_resource_id_by_email(settings, all_users, all_shared_mailboxes, mailbox_alias)
         if not resource_id:
             error_msg = f"Пользователь или общий ящик {mailbox_alias} не найден в организации"
             logger.error(error_msg)
             mailbox_detail["error"] = error_msg
-            stats["errors"] += 1
-            stats["details"].append(mailbox_detail)
-            continue
-        
-        if not resource_id:
-            error_msg = f"Не удалось получить resource_id для пользователя или общего ящика {mailbox_alias}"
-            logger.error(error_msg)
-            mailbox_detail["error"] = error_msg
-            stats["errors"] += 1
             stats["details"].append(mailbox_detail)
             continue
         
@@ -2325,7 +2594,6 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
                 error_msg = f"Не удалось получить список делегатов для ящика {mailbox_alias}"
                 logger.error(error_msg)
                 mailbox_detail["error"] = error_msg
-                stats["errors"] += 1
                 stats["details"].append(mailbox_detail)
                 continue
         else:
@@ -2346,18 +2614,14 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
                 if result:
                     logger.info(f"  ✓ Делегирование успешно включено для {mailbox_alias}")
                     mailbox_detail["delegation_restored"] = True
-                    stats["success"] += 1
                 else:
                     logger.error(f"  ✗ Не удалось включить делегирование для {mailbox_alias}")
                     mailbox_detail["error"] = "Ошибка включения делегирования"
-                    stats["errors"] += 1
                     stats["details"].append(mailbox_detail)
                     continue
-                stats["processed"] += 1
             else:
                 logger.info("  Делегирование уже включено, пропуск операции")
                 mailbox_detail["delegation_restored"] = True
-                stats["success"] += 1
             
             # Шаг 2: Устанавливаем разрешения (если есть различия)
             if compare_actors_lists(current_actors, target_actors):
@@ -2367,23 +2631,16 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
                 if task_ids and len(task_ids) == len(target_actors):
                     logger.info(f"  ✓ Все делегаты успешно восстановлены для {mailbox_alias}")
                     mailbox_detail["actors_restored"] = True
-                    stats["success"] += 1
                 elif task_ids:
                     logger.warning(f"  ⚠ Частично восстановлены делегаты для {mailbox_alias}: {len(task_ids)}/{len(target_actors)}")
                     mailbox_detail["actors_restored"] = "partial"
                     mailbox_detail["error"] = f"Восстановлено только {len(task_ids)} из {len(target_actors)} делегатов"
-                    stats["success"] += 1
-                    stats["errors"] += 1
                 else:
                     logger.error(f"  ✗ Не удалось восстановить делегатов для {mailbox_alias}")
                     mailbox_detail["error"] = "Ошибка восстановления делегатов"
-                    stats["errors"] += 1
-                
-                stats["processed"] += 1
             else:
                 logger.info("  Списки делегатов идентичны, пропуск операции")
                 mailbox_detail["actors_restored"] = True
-                stats["success"] += 1
         
         # Сценарий 2: Удаление делегатов и отключение делегирования
         elif target_delegation_enabled is False and target_actors is not None and len(target_actors) == 0:
@@ -2397,23 +2654,16 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
                 if task_ids and len(task_ids) == len(current_actors):
                     logger.info(f"  ✓ Все делегаты успешно удалены для {mailbox_alias}")
                     mailbox_detail["actors_restored"] = True
-                    stats["success"] += 1
                 elif task_ids:
                     logger.warning(f"  ⚠ Частично удалены делегаты для {mailbox_alias}: {len(task_ids)}/{len(current_actors)}")
                     mailbox_detail["actors_restored"] = "partial"
                     mailbox_detail["error"] = f"Удалено только {len(task_ids)} из {len(current_actors)} делегатов"
-                    stats["success"] += 1
-                    stats["errors"] += 1
                 else:
                     logger.error(f"  ✗ Не удалось удалить делегатов для {mailbox_alias}")
                     mailbox_detail["error"] = "Ошибка удаления делегатов"
-                    stats["errors"] += 1
-                
-                stats["processed"] += 1
             else:
                 logger.info("  Список делегатов уже пуст, пропуск операции")
                 mailbox_detail["actors_restored"] = True
-                stats["success"] += 1
             
             # Шаг 2: Выключаем делегирование (если включено)
             if current_delegation_enabled:
@@ -2422,17 +2672,12 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
                 if result: 
                     logger.info(f"  ✓ Делегирование успешно выключено для {mailbox_alias}")
                     mailbox_detail["delegation_restored"] = True
-                    stats["success"] += 1
                 else:
                     logger.error(f"  ✗ Не удалось выключить делегирование для {mailbox_alias}")
                     mailbox_detail["error"] = "Ошибка выключения делегирования для ящика с resourceId={resource_id}"
-                    stats["errors"] += 1
-                
-                stats["processed"] += 1
             else:
                 logger.info("  Делегирование уже выключено, пропуск операции")
                 mailbox_detail["delegation_restored"] = True
-                stats["success"] += 1
         
         # Обработка только изменения delegation_enabled без изменения actors
         elif target_delegation_enabled is not None and target_actors is None:
@@ -2444,27 +2689,20 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
                     if result:
                         logger.info(f"  ✓ Делегирование успешно включено для {mailbox_alias}")
                         mailbox_detail["delegation_restored"] = True
-                        stats["success"] += 1
                     else:
                         logger.error(f"  ✗ Не удалось включить делегирование для {mailbox_alias}")
                         mailbox_detail["error"] = "Ошибка включения делегирования для ящика с resourceId={resource_id}"
-                        stats["errors"] += 1
                 else:
                     result = disable_mailbox_delegation(settings, resource_id)
                     if result:
                         logger.info(f"  ✓ Делегирование успешно выключено для {mailbox_alias}")
                         mailbox_detail["delegation_restored"] = True
-                        stats["success"] += 1
                     else:
                         logger.error(f"  ✗ Не удалось выключить делегирование для {mailbox_alias}")
                         mailbox_detail["error"] = "Ошибка выключения делегирования для ящика с resourceId={resource_id}"
-                        stats["errors"] += 1
-                
-                stats["processed"] += 1
             else:
                 logger.info("  Статус делегирования уже соответствует целевому, пропуск операции")
                 mailbox_detail["delegation_restored"] = True
-                stats["success"] += 1
         
         # Обработка только изменения actors без изменения delegation_enabled
         elif target_delegation_enabled is None and target_actors is not None:
@@ -2483,29 +2721,27 @@ def restore_permissions_from_diff(missing_lines: list, settings: "SettingParams"
                 if task_ids and len(task_ids) == expected_count:
                     logger.info(f"  ✓ Делегаты успешно обновлены для {mailbox_alias}")
                     mailbox_detail["actors_restored"] = True
-                    stats["success"] += 1
                 elif task_ids:
                     logger.warning(f"  ⚠ Частично обновлены делегаты для {mailbox_alias}: {len(task_ids)}/{expected_count}")
                     mailbox_detail["actors_restored"] = "partial"
                     mailbox_detail["error"] = f"Обновлено только {len(task_ids)} из {expected_count} делегатов"
-                    stats["success"] += 1
-                    stats["errors"] += 1
                 else:
                     logger.error(f"  ✗ Не удалось обновить делегатов для {mailbox_alias}")
                     mailbox_detail["error"] = "Ошибка обновления делегатов"
-                    stats["errors"] += 1
-                
-                stats["processed"] += 1
             else:
                 logger.info("  Списки делегатов идентичны, пропуск операции")
                 mailbox_detail["actors_restored"] = True
-                stats["success"] += 1
         
         stats["details"].append(mailbox_detail)
     
+    # Вычисляем итоговую статистику из деталей по каждому ящику
+    stats["processed"] = len(stats["details"])
+    stats["errors"] = sum(1 for d in stats["details"] if d.get("error") is not None)
+    stats["success"] = stats["processed"] - stats["errors"]
+    
     logger.info("="*80)
     logger.info("ЗАВЕРШЕНИЕ ВОССТАНОВЛЕНИЯ РАЗРЕШЕНИЙ")
-    logger.info(f"Всего строк для восстановления: {stats['total']}")
+    logger.info(f"Всего ящиков для восстановления: {stats['total']}")
     logger.info(f"Обработано: {stats['processed']}")
     logger.info(f"Успешно: {stats['success']}")
     logger.info(f"Ошибок: {stats['errors']}")
@@ -2593,12 +2829,147 @@ def append_mailbox_actors(
         logger.error(f"{thread_prefix}Ошибка при сохранении списка делегатов ящика {mailbox_alias}: {str(e)}")
         return False
 
+async def select_method_for_delete_messages(
+    delegated_mailbox_alias: str,
+    delegate_alias: str,
+    messages_to_delete: list,
+    org_domain: str,
+    settings: "SettingParams",
+    thread_id: int = 0,
+    checkpoint_file: Optional[str] = None,
+    checkout_file: Optional[str] = None,
+    report_file: Optional[str] = None
+):
+    """
+    Определяет и выполняет подходящий метод удаления сообщений для ящика.
+    
+    Выбирает между режимами delegate, service_application или skip
+    в зависимости от типа ящика и настроек run_mode.
+    
+    Args:
+        delegated_mailbox_alias: Email целевого почтового ящика
+        delegate_alias: Алиас делегата
+        messages_to_delete: Список сообщений для удаления
+        org_domain: Домен организации
+        settings: Объект настроек
+        thread_id: ID потока для логирования
+        checkpoint_file: Путь к файлу checkin
+        checkout_file: Путь к файлу checkout
+        report_file: Путь к файлу отчета
+        
+    Returns:
+        dict: Результат операции с полями success, message, deleted_messages
+    """
+    thread_prefix = f"[THREAD #{thread_id}] " if thread_id > 0 else ""
+    mode = "skip"
+    status = ""
+    error = ""
+    all_users = get_all_api360_users(settings, force=False, suppress_messages=True)
+    all_shared_mailboxes = get_all_shared_mailboxes_cached(settings, force=False, suppress_messages=True)
+    
+    resource_id, resource_type, isEnabled = get_resource_id_by_email(settings, all_users, all_shared_mailboxes, delegated_mailbox_alias)
+    resource_id2, resource_type2, isEnabled2 = get_resource_id_by_email(settings, all_users, all_shared_mailboxes, settings.delegate_alias)
+    
+    if not resource_id:
+        mode = "skip"
+        status = f"Ящик {delegated_mailbox_alias} не найден."
+        error = "Not found."
+
+    if resource_id == resource_id2:
+        if settings.run_mode in ["service_application", "hybrid"]:
+            mode = "service_application"
+        else:
+            print(f"Ящик {delegated_mailbox_alias} из-за совпадения с алисом делегата обработать в режиме 'delegated' нельзя. Пропускаем ящик.")
+            mode = "skip"
+            status = f"Ящик {delegated_mailbox_alias} из-за совпадения с алисом делегата обработать в режиме 'delegated' нельзя. Пропускаем ящик."
+            error = "Shared mailbox. Can't use service application."
+    else:
+        # Определяем режим работы для ящика
+        if resource_type == "shared_mailbox":
+            if settings.run_mode == "service_application":
+                mode = "skip"
+                status = f"Ящик {delegated_mailbox_alias} является общим ящиком. Использовать сервисное приложение невозможно."
+                error = "Shared mailbox. Can't use service application."
+            else:
+                mode = "delegate"
+        else:
+            if settings.run_mode == "delegate":
+                mode = "delegate"
+            else:
+                if isEnabled:
+                    if settings.run_mode in ["service_application", "hybrid"]:
+                        mode = "service_application"
+                    else:
+                        mode = "delegate"
+                else:
+                    if settings.run_mode == "hybrid":
+                        # Ящик заблокирован, работаем в режиме делегата
+                        mode = "delegate"
+                    else:
+                        # Если ящик заблокрован и режим работы только через сервисное приложение, пропускаем ящик
+                        mode = "skip"
+                        status = f"Ящик {delegated_mailbox_alias} заблокирован. Использовать сервисное приложение невозможно."
+                        error = "User blocked. Can't use service application."
+
+    if mode == "skip":
+        if report_file:
+            def normalize_message_id(value: str) -> str:
+                return value.replace("<", "").replace(">", "").strip()
+            
+            message_meta = {
+                normalize_message_id(msg.get("message_id", "")): msg
+                for msg in messages_to_delete
+            }
+            
+            for msg in messages_to_delete:
+                msg_id = msg.get("message_id", "")
+                append_report_record(
+                    report_file=report_file,
+                    thread_id=thread_id,
+                    email=delegated_mailbox_alias,
+                    mailbox_type=resource_type,
+                    status=status,
+                    folder="",
+                    message_id=msg_id,
+                    message_date=msg.get("message_date", ""),
+                    time_shift=msg.get("days_diff", ""),
+                    dry_run="true" if settings.dry_run else "false",
+                    error=error
+                )
+        else:
+            logger.debug(f"{thread_prefix}Файл отчета не указан, пропускаем запись результатов удаления")
+        return {
+            "success": False,
+            "message": status,
+            "deleted_messages": {}
+        }
+    else:
+        if mode == "delegate":
+            return await temporary_delegate_and_delete_messages(
+                delegated_mailbox_alias=delegated_mailbox_alias, 
+                delegate_alias=delegate_alias, 
+                messages_to_delete=messages_to_delete, 
+                org_domain=org_domain, 
+                settings=settings, 
+                thread_id=thread_id, 
+                checkpoint_file=checkpoint_file, 
+                checkout_file=checkout_file, 
+                report_file=report_file)
+        else:
+            return await delete_messages_by_service_application(
+                delegated_mailbox_alias=delegated_mailbox_alias, 
+                delegate_alias=delegate_alias, 
+                messages_to_delete=messages_to_delete, 
+                org_domain=org_domain, 
+                settings=settings, 
+                thread_id=thread_id, 
+                report_file=report_file)
+
 
 async def temporary_delegate_and_delete_messages(
     delegated_mailbox_alias: str,
     delegate_alias: str,
     messages_to_delete: list,
-    app_password: str,
     org_domain: str,
     settings: "SettingParams",
     thread_id: int = 0,
@@ -2621,21 +2992,27 @@ async def temporary_delegate_and_delete_messages(
     9. Если делегирование было выключено - выключает его обратно
     
     Args:
-        delegated_mailbox_alias: Алиас делегированного почтового ящика (email)
-        delegate_alias: Алиас делегата (логин на Яндексе, например "i.petrov")
-        messages_to_delete: Список словарей с информацией о сообщениях для удаления.
-            Каждый словарь должен содержать:
-            - message_id: идентификатор сообщения
-            - message_date: дата сообщения в формате "DD-MM-YYYY"
-            - days_diff: количество дней для диапазона поиска (по умолчанию ±1 день)
-        app_password: Пароль приложения для делегата
-        org_domain: Домен организации (например, "example.ru")
-        settings: Объект настроек с oauth_token и organization_id
-        thread_id: Идентификатор потока для логирования
-        all_users: Список всех пользователей организации (для оптимизации запросов к API)
-        checkpoint_file: Путь к checkpoint файлу для сохранения состояния почтового ящика (до изменений)
-        checkout_file: Путь к checkout файлу для сохранения состояния почтового ящика (после восстановления)
-        report_file: Путь к файлу отчета для записи результатов удаления
+        delegated_mailbox_alias: str
+            Алиас делегированного почтового ящика (например, "office@example.ru").
+        delegate_alias: str
+            Алиас делегата (логин пользователя без домена, например "i.petrov").
+        messages_to_delete: list
+            Список словарей с сообщениями для удаления. Каждый словарь должен содержать ключи:
+                - message_id: str — идентификатор сообщения (Message-ID)
+                - message_date: str — дата сообщения в формате "DD-MM-YYYY"
+                - days_diff: int — допустимое отклонение в днях для поиска сообщения (обычно ±1 день)
+        org_domain: str
+            Домен организации (например, "example.ru").
+        settings: SettingParams
+            Объект с параметрами конфигурации (например, oauth_token, organization_id, check_dir и др.).
+        thread_id: int, optional
+            Идентификатор потока для логирования (по умолчанию 0).
+        checkpoint_file: Optional[str], optional
+            Путь к checkpoint-файлу для сохранения исходного состояния почтового ящика (до изменений).
+        checkout_file: Optional[str], optional
+            Путь к checkout-файлу для сохранения состояния после восстановления прав (по окончании работы).
+        report_file: Optional[str], optional
+            Путь к файлу отчёта, в который будут записаны результаты удаления сообщений.
         
     Returns:
         dict: Словарь с результатами операции:
@@ -2659,7 +3036,6 @@ async def temporary_delegate_and_delete_messages(
                     "days_diff": 2
                 }
             ],
-            app_password="app_password_here",
             org_domain="example.ru",
             settings=settings,
             thread_id=1
@@ -2688,13 +3064,13 @@ async def temporary_delegate_and_delete_messages(
     delegate_original_roles = None  # Исходные роли делегата (None если его не было)
     has_owner_permission = False  # Инициализируем заранее для блока except
 
-    all_users = get_all_api360_users(settings, force=False)
-    all_shared_mailboxes = get_all_shared_mailboxes_cached(settings, force=False)
+    all_users = get_all_api360_users(settings, force=False, suppress_messages=False)
+    all_shared_mailboxes = get_all_shared_mailboxes_cached(settings, force=False, suppress_messages=False)
     
     try:
         # Шаг 1: Находим делегированный почтовый ящик
         logger.info(f"{thread_prefix}Шаг 1: Поиск делегированного почтового ящика...")
-        resource_id, resource_type = get_resource_id_by_email(settings, all_users, all_shared_mailboxes, delegated_mailbox_alias)
+        resource_id, resource_type, isEnabled = get_resource_id_by_email(settings, all_users, all_shared_mailboxes, delegated_mailbox_alias)
         
         if not resource_id:
             result["message"] = f"Делегированный ящик {delegated_mailbox_alias} не найден"
@@ -2710,7 +3086,7 @@ async def temporary_delegate_and_delete_messages(
         
         # Формируем полный email делегата для поиска
         delegate_email = f"{delegate_alias}@{org_domain}"
-        delegate_user_id, delegate_user_type = get_resource_id_by_email(settings, all_users, all_shared_mailboxes,delegate_email)
+        delegate_user_id, delegate_user_type, isEnabled = get_resource_id_by_email(settings, all_users, all_shared_mailboxes,delegate_email)
         
         if not delegate_user_id:
             result["message"] = f"Делегат {delegate_email} не найден"
@@ -2878,7 +3254,7 @@ async def temporary_delegate_and_delete_messages(
             delegate_alias=delegate_alias,
             delegated_mailbox_alias=mailbox_name,
             org_domain=org_domain,
-            app_password=app_password,
+            mode="delegate",
             messages_to_delete=messages_to_delete,
             settings=settings,
             thread_id=thread_id
@@ -3167,6 +3543,147 @@ async def temporary_delegate_and_delete_messages(
     
     return result
 
+async def delete_messages_by_service_application(
+    delegated_mailbox_alias: str,
+    delegate_alias: str,
+    messages_to_delete: list,
+    org_domain: str,
+    settings: "SettingParams",
+    thread_id: int = 0,
+    report_file: Optional[str] = None
+):
+    """
+    Удаляет сообщения через IMAP с использованием токена сервисного приложения.
+    
+    В отличие от режима делегирования, не требует временного назначения прав.
+    Использует OAuth XOAUTH2 авторизацию через сервисное приложение.
+    
+    Args:
+        delegated_mailbox_alias: Email целевого почтового ящика
+        delegate_alias: Алиас делегата (не используется в этом режиме)
+        messages_to_delete: Список сообщений для удаления
+        org_domain: Домен организации
+        settings: Объект настроек с application_client_id и secret
+        thread_id: ID потока для логирования
+        report_file: Путь к файлу отчета
+        
+    Returns:
+        dict: Результат операции с полями success, message, deleted_messages
+    """
+    # Формируем префикс для логов
+    thread_prefix = f"[THREAD #{thread_id}] " if thread_id > 0 else ""
+    
+    logger.info(f"{thread_prefix}" + "=" * 80)
+    logger.info(f"{thread_prefix}Начало обработки ящика с помощью сервисного приложения: {delegated_mailbox_alias}")
+    logger.info(f"{thread_prefix}Количество сообщений для удаления: {len(messages_to_delete)}")
+    logger.info(f"{thread_prefix}" + "=" * 80)
+    
+    result = {
+        "success": False,
+        "message": "",
+        "deleted_messages": {}
+    }
+    
+    try:
+        # Шаг 1: Подключаемся по IMAP и удаляем сообщения
+        logger.info(f"{thread_prefix}Удаление сообщений через IMAP для ящика {delegated_mailbox_alias}...")
+        
+        # Извлекаем только имя ящика без домена
+        if "@" in delegated_mailbox_alias:
+            mailbox_name = delegated_mailbox_alias.split('@')[0]
+        else:
+            mailbox_name = delegated_mailbox_alias
+        
+        deleted_results = await delete_messages_via_imap_basic_auth(
+            delegate_alias=delegate_alias,
+            delegated_mailbox_alias=mailbox_name,
+            org_domain=org_domain,
+            mode="service_application",
+            messages_to_delete=messages_to_delete,
+            settings=settings,
+            thread_id=thread_id
+        )
+        
+        result["deleted_messages"] = deleted_results
+        logger.info(f"{thread_prefix}Обработано сообщений: {len(deleted_results)}")
+        
+        # Записываем результаты удаления в файл отчета
+        if report_file:
+            def normalize_message_id(value: str) -> str:
+                return value.replace("<", "").replace(">", "").strip()
+            
+            message_meta = {
+                normalize_message_id(msg.get("message_id", "")): msg
+                for msg in messages_to_delete
+            }
+            
+            if not deleted_results:
+                for msg in messages_to_delete:
+                    msg_id = msg.get("message_id", "")
+                    append_report_record(
+                        report_file=report_file,
+                        thread_id=thread_id,
+                        email=delegated_mailbox_alias,
+                        mailbox_type="user_mailbox",
+                        status="not found",
+                        folder="",
+                        message_id=msg_id,
+                        message_date=msg.get("message_date", ""),
+                        time_shift=msg.get("days_diff", ""),
+                        dry_run="true" if settings.dry_run else "false",
+                        error=""
+                    )
+            else:
+                for msg_id, msg_data in deleted_results.items():
+                    normalized_msg_id = normalize_message_id(msg_id)
+                    msg_meta = message_meta.get(normalized_msg_id, {})
+                    message_date = msg_meta.get("message_date", "")
+                    time_shift = msg_meta.get("days_diff", "")
+                    
+                    if isinstance(msg_data, dict):
+                        status_text = msg_data.get("status", "")
+                        folders = msg_data.get("folders", [])
+                    else:
+                        status_text = str(msg_data)
+                        folders = []
+                    
+                    status_lower = status_text.lower()
+                    is_fail = ("ошибка" in status_lower) or ("error" in status_lower)
+                    status = "fail" if is_fail else "success"
+                    error_text = status_text if is_fail else ""
+                    dry_run_value = "true" if settings.dry_run else "false"
+                    folder_value = ",".join(folders) if folders else ""
+                    
+                    append_report_record(
+                        report_file=report_file,
+                        thread_id=thread_id,
+                        email=delegated_mailbox_alias,
+                        mailbox_type="user_mailbox",
+                        status=status,
+                        folder=folder_value,
+                        message_id=msg_id,
+                        message_date=message_date,
+                        time_shift=time_shift,
+                        dry_run=dry_run_value,
+                        error=error_text
+                    )
+        else:
+            logger.debug(f"{thread_prefix}Файл отчета не указан, пропускаем запись результатов удаления")
+        
+        result["success"] = True
+        result["message"] = f"Успешно обработан ящик {delegated_mailbox_alias}"
+        logger.info(f"{thread_prefix}" + "=" * 80)
+        logger.info(f"{thread_prefix}Обработка завершена успешно")
+        logger.info(f"{thread_prefix}" + "=" * 80)
+        
+    except Exception as e:
+        error_msg = f"Критическая ошибка: {type(e).__name__}: {e}"
+        logger.error(f"{thread_prefix}{error_msg}")
+        logger.error(f"{thread_prefix}Детали: at line {e.__traceback__.tb_lineno} of {__file__}")
+        result["message"] = error_msg
+    
+    return result
+
 async def process_multiple_mailboxes_parallel(
     mailboxes_data: list,
     settings: "SettingParams",
@@ -3184,8 +3701,8 @@ async def process_multiple_mailboxes_parallel(
             - delegated_mailbox_alias: алиас делегированного ящика (email)
             - delegate_alias: алиас делегата (логин)
             - messages_to_delete: список словарей с информацией о сообщениях (message_id, message_date, days_diff)
-            - app_password: пароль приложения
             - org_domain: домен организации
+            - mode: режим работы для ящика (delegate, service_application, skip)
         settings: Объект настроек
         checkpoint_file: Путь к checkpoint файлу для сохранения состояния почтовых ящиков (до изменений)
         checkout_file: Путь к checkout файлу для сохранения состояния почтовых ящиков (после восстановления)
@@ -3211,8 +3728,8 @@ async def process_multiple_mailboxes_parallel(
                         "days_diff": 1
                     }
                 ],
-                "app_password": "app_password_1",
-                "org_domain": "example.ru"
+                "org_domain": "example.ru",
+                "mode": "delegate"
             },
             {
                 "delegated_mailbox_alias": "sales@example.ru",
@@ -3224,8 +3741,8 @@ async def process_multiple_mailboxes_parallel(
                         "days_diff": 2
                     }
                 ],
-                "app_password": "app_password_2",
-                "org_domain": "example.ru"
+                "org_domain": "example.ru",
+                "mode": "delegate"
             }
         ]
         
@@ -3234,6 +3751,26 @@ async def process_multiple_mailboxes_parallel(
         for i, result in enumerate(results):
             print(f"Ящик {mailboxes_data[i]['delegated_mailbox_alias']}: {result['message']}")
     """
+    
+    if settings.run_mode == "service_application":
+        result = check_service_app_status(settings, skip_permissions_check=True)
+        if not result:
+            logger.error("Сервисное приложение не настрено. Продолжение работы невозможно.")
+            return []
+    elif settings.run_mode == "hybrid":
+        result = check_service_app_status(settings, skip_permissions_check=True)
+        if not result:
+            logger.error("Сервисное приложение не настрено. Работа в режиме делегирования.")
+            settings.run_mode = "delegate"
+        else:
+            settings.run_mode = "hybrid"
+    else:
+        env_mode = os.environ.get("RUN_MODE", "delegate")
+        if env_mode == "hybrid":
+            result = check_service_app_status(settings, skip_permissions_check=True)
+            if result:
+                settings.run_mode = "hybrid"
+    
     logger.info("=" * 100)
     logger.info(f"Начало параллельной обработки {len(mailboxes_data)} делегированных ящиков")
     logger.info(f"Максимальное количество одновременных задач: {MAX_PARALLEL_THREADS}")
@@ -3243,45 +3780,16 @@ async def process_multiple_mailboxes_parallel(
     valid_mailboxes = []
     skipped_mailboxes = []
 
-    # all_users = get_all_api360_users(settings, force=False)
-    # if not all_users:
-    #     logger.error("Не удалось получить список всех пользователей. Завершение работы.")
-    #     return []
+    all_users = get_all_api360_users(settings, force=False)
+    if not all_users:
+        logger.error("Не удалось получить список всех пользователей. Завершение работы.")
+        return []
     
     # Генерируем thread_id для каждого ящика (начиная с 1)
     for idx, mailbox_data in enumerate(mailboxes_data, start=1):
         # Добавляем thread_id к данным ящика
         mailbox_data["thread_id"] = idx
-        delegated_mailbox_alias = mailbox_data["delegated_mailbox_alias"]
-        
-        # Получаем информацию о пользователе
-        #user = get_user_by_email(settings, all_users, delegated_mailbox_alias)
-        
-        #if user:
-            # Извлекаем алиас из email (часть до @)
-        if '@' in delegated_mailbox_alias:
-            mailbox_alias_part = delegated_mailbox_alias.split('@')[0].lower()
-        else:
-            mailbox_alias_part = delegated_mailbox_alias.lower()
-            
-        # # Проверяем, совпадает ли имя ящика с nickname пользователя
-        # user_nickname = user.get('nickname', '').lower()
-        # user_aliases = [a.lower() for a in user.get('aliases', [])]
-            
-        # Если имя ящика совпадает с nickname или входит в список aliases
-        if settings.delegate_alias == mailbox_alias_part:
-            warning_msg = (
-                f"ВНИМАНИЕ: Ящик '{delegated_mailbox_alias}' совпадает с алиасом пользователя, от которого происходит удаление сообщений, поэтому обработка пропущена. "
-                f"(алиас: {settings.delegate_alias}). "
-            )
-            logger.warning(warning_msg)
-            skipped_mailboxes.append({
-                "mailbox_data": mailbox_data,
-                "reason": warning_msg
-            })
-            continue
-        else:
-            valid_mailboxes.append(mailbox_data)        
+        valid_mailboxes.append(mailbox_data)        
     
     # Логируем результаты фильтрации
     if skipped_mailboxes:
@@ -3301,11 +3809,10 @@ async def process_multiple_mailboxes_parallel(
             thread_id = mailbox_data.get("thread_id", 0)
             thread_prefix = f"[THREAD #{thread_id}] " if thread_id > 0 else ""
             logger.debug(f"{thread_prefix}Начало обработки ящика {mailbox_data['delegated_mailbox_alias']}")
-            result = await temporary_delegate_and_delete_messages(
+            result = await select_method_for_delete_messages(
                 delegated_mailbox_alias=mailbox_data["delegated_mailbox_alias"],
                 delegate_alias=mailbox_data["delegate_alias"],
                 messages_to_delete=mailbox_data["messages_to_delete"],
-                app_password=mailbox_data["app_password"],
                 org_domain=mailbox_data["org_domain"],
                 settings=settings,
                 thread_id=thread_id,
@@ -3391,6 +3898,8 @@ async def process_multiple_mailboxes_parallel(
 class SettingParams:
     oauth_token: str
     organization_id: int
+    application_client_id: str
+    application_client_secret: str
     message_id_file_name: str
     mailboxes_to_search_file_name: str
     dry_run: bool
@@ -3408,6 +3917,8 @@ class SettingParams:
     mailboxes_list_file: str
     reports_dir: str
     message_ids_file: str
+    service_app_api_data_file: str
+    run_mode: str
 
 async def test_delegate_imap_connection(delegate_alias: str, delegate_domain: str, delegate_password: str) -> bool:
     """
@@ -3455,20 +3966,41 @@ async def test_delegate_imap_connection(delegate_alias: str, delegate_domain: st
         return False
 
 def check_oauth_token(oauth_token, org_id):
-    """Проверяет, что токен OAuth действителен."""
+    """
+    Проверяет валидность OAuth-токена запросом к API.
+    
+    Args:
+        oauth_token: OAuth-токен для проверки
+        org_id: ID организации
+        
+    Returns:
+        bool: True если токен валиден, False в противном случае
+    """
     url = f'{DEFAULT_360_API_URL}/directory/v1/org/{org_id}/users?perPage=100'
     headers = {
         'Authorization': f'OAuth {oauth_token}'
     }
-    response = requests.get(url, headers=headers)
+    with httpx.Client(headers=headers) as client:
+        response = client.get(url)
     if response.status_code == HTTPStatus.OK:
         return True
     return False
 
 def get_settings():
+    """
+    Создает и валидирует объект настроек из переменных окружения.
+    
+    Загружает параметры из переменных окружения, проверяет их корректность,
+    валидирует OAuth-токен и тестирует IMAP-подключение.
+    
+    Returns:
+        SettingParams: Объект настроек или None при ошибке валидации
+    """
     settings = SettingParams (
         oauth_token = os.environ.get("OAUTH_TOKEN_ARG"),
         organization_id = int(os.environ.get("ORGANIZATION_ID_ARG")),
+        application_client_id = os.environ.get("APPLICATION_CLIENT_ID_ARG"),
+        application_client_secret = os.environ.get("APPLICATION_CLIENT_SECRET_ARG"),
         message_id_file_name = os.environ.get("MESSAGE_ID_FILE_NAME","message_id.txt"),
         mailboxes_to_search_file_name = os.environ.get("MAILBOXES_TO_SEARCH_FILE_NAME","mailboxes_to_search.txt"),
         dry_run = False,
@@ -3486,6 +4018,8 @@ def get_settings():
         mailboxes_list_file = os.environ.get("MAILBOXES_LIST_FILE", "mailboxes_list.csv"),
         reports_dir = os.environ.get("REPORTS_DIR", "reports"),
         message_ids_file = os.environ.get("MESSAGE_IDS_FILE", "message-ids.csv"),
+        service_app_api_data_file = os.environ.get("SERVICE_APP_API_DATA_FILE", "service_api_data.txt"),
+        run_mode = os.environ.get("RUN_MODE", "delegate"),
     )
 
     exit_flag = False
@@ -3499,7 +4033,7 @@ def get_settings():
         exit_flag = True
 
     if not (oauth_token_bad or exit_flag):
-        hard_error, result_ok = check_token_permissions(settings.oauth_token, settings.organization_id, NEEDED_PERMISSIONS)
+        hard_error, result_ok = check_token_permissions_simple(settings.oauth_token, settings.organization_id, NEEDED_PERMISSIONS)
         if hard_error:
             logger.error("OAUTH_TOKEN не является действительным или не имеет необходимых прав доступа")
             oauth_token_bad = True
@@ -3508,22 +4042,35 @@ def get_settings():
             print("=" * 100)
             input("Нажмите Enter для продолжения..")
 
-    # Проверка параметров делегата
-    if not settings.delegate_alias:
-        logger.error("DELEGATE_ALIAS не установлен")
+    if settings.run_mode not in ["delegate", "service_application", "hybrid"]:
+        logger.error("RUN_MODE должен быть delegate, service_application или hybrid")
         exit_flag = True
+    else:
+        logger.info(f"RUN_MODE установлен в {settings.run_mode}")
 
-    if "@" in settings.delegate_alias:
-        settings.delegate_alias = settings.delegate_alias.split("@")[0] # remove domain from alias
-        logger.info(f"Установлен DELEGATE_ALIAS: {settings.delegate_alias} (домен удален)")
-    
-    if not settings.delegate_domain:
-        logger.error("DELEGATE_DOMAIN не установлен")
-        exit_flag = True
-    
-    if not settings.delegate_password:
-        logger.error("DELEGATE_PASSWORD не установлен")
-        exit_flag = True
+    if settings.run_mode in ["delegate", "hybrid"]:
+        # Проверка параметров делегата
+        if not settings.delegate_alias:
+            logger.error("DELEGATE_ALIAS не установлен")
+            exit_flag = True
+        if "@" in settings.delegate_alias:
+            settings.delegate_alias = settings.delegate_alias.split("@")[0] # remove domain from alias
+            logger.info(f"Установлен DELEGATE_ALIAS: {settings.delegate_alias} (домен удален)")
+        if not settings.delegate_domain:
+            logger.error("DELEGATE_DOMAIN не установлен")
+            exit_flag = True
+        if not settings.delegate_password:
+            logger.error("DELEGATE_PASSWORD не установлен")
+            exit_flag = True
+
+    if settings.run_mode == "service_application":
+        # Проверка параметров сервисного приложения
+        if not settings.application_client_id:
+            logger.error("APPLICATION_CLIENT_ID не установлен")
+            exit_flag = True
+        if not settings.application_client_secret:
+            logger.error("APPLICATION_CLIENT_SECRET не установлен")
+            exit_flag = True
 
     if os.environ.get("DRY_RUN"):
         if os.environ.get("DRY_RUN").lower() == "true":
@@ -3539,23 +4086,30 @@ def get_settings():
     if exit_flag or oauth_token_bad:
         return None
     
-    # Проверяем подключение к IMAP с учетными данными делегата
-    logger.info("Проверка подключения к IMAP с учетными данными делегата...")
-    connection_test = asyncio.run(test_delegate_imap_connection(
-        settings.delegate_alias,
-        settings.delegate_domain,
-        settings.delegate_password
-    ))
-    
-    if not connection_test:
-        logger.error("=" * 80)
-        logger.error("!!! ОШИБКА: Не удалось подключиться к IMAP с учетными данными делегата !!!")
-        logger.error("Проверьте правильность параметров:")
-        logger.error(f"  - DELEGATE_ALIAS: {settings.delegate_alias} (алиас делегата)")
-        logger.error(f"  - DELEGATE_DOMAIN: {settings.delegate_domain} (домен организации)")
-        logger.error(f"  - DELEGATE_PASSWORD: {'*' * len(settings.delegate_password) if settings.delegate_password else '(не задан)'} (пароль делегата)")
-        logger.error("=" * 80)
-        return None
+    if settings.run_mode in ["delegate", "hybrid"]:
+        # Проверяем подключение к IMAP с учетными данными делегата
+        logger.info("Проверка подключения к IMAP с учетными данными делегата...")
+        connection_test = asyncio.run(test_delegate_imap_connection(
+            settings.delegate_alias,
+            settings.delegate_domain,
+            settings.delegate_password
+        ))
+        
+        if not connection_test:
+            logger.error("=" * 80)
+            logger.error("!!! ОШИБКА: Не удалось подключиться к IMAP с учетными данными делегата !!!")
+            logger.error("Проверьте правильность параметров:")
+            logger.error(f"  - DELEGATE_ALIAS: {settings.delegate_alias} (алиас делегата)")
+            logger.error(f"  - DELEGATE_DOMAIN: {settings.delegate_domain} (домен организации)")
+            logger.error(f"  - DELEGATE_PASSWORD: {'*' * len(settings.delegate_password) if settings.delegate_password else '(не задан)'} (пароль делегата)")
+            logger.error("=" * 80)
+            return None
+
+    if settings.run_mode in ["service_application", "hybrid"]:
+        check_service_app_status(settings, skip_permissions_check=True)
+        if not settings.service_app_status:
+            logger.error("Сервисное приложение не настроено. Настройте сервисное приложение через меню настроек.")
+
     
     logger.info("=" * 80)
     logger.info("✓ IMAP подключение делегата успешно проверено.")
@@ -3563,26 +4117,131 @@ def get_settings():
     
     return settings
 
-def check_token_permissions(token: str, org_id: int, needed_permissions: list) -> bool:
+def check_token_permissions_simple(token: str, org_id: int, needed_permissions: list) -> tuple[bool, bool]:
+    """
+    Проверяет наличие необходимых прав у OAuth-токена.
+    
+    Args:
+        token: OAuth-токен для проверки
+        org_id: ID организации
+        needed_permissions: Список требуемых разрешений
+        
+    Returns:
+        tuple: (hard_error: bool, result_ok: bool)
+            - hard_error: True при критической ошибке (невалидный токен)
+            - result_ok: True если все права присутствуют
+    """
+    result, data = check_token_permissions_api(token)
+    if not result:
+        return True, False
+    else:
+        try:
+            # Извлечение scopes и orgIds из ответа
+            token_scopes = data.get('scopes', [])
+            token_org_ids = data.get('orgIds', [])
+            login = data.get('login', 'unknown')
+            
+            logger.info(f"Проверка прав доступа для токена пользователя: {login}")
+            logger.debug(f"Доступные права: {token_scopes}")
+            logger.debug(f"Доступные организации: {token_org_ids}")
+            
+            # Проверка наличия org_id в списке доступных организаций
+            if str(org_id) not in [str(org) for org in token_org_ids]:
+                logger.error("=" * 100)
+                logger.error(f"ОШИБКА: Токен не имеет доступа к организации с ID {org_id}")
+                logger.error(f"Доступные организации для этого токена: {token_org_ids}")
+                logger.error("=" * 100)
+                return True, False
+
+            # Проверка наличия всех необходимых прав
+            missing_permissions = []
+            for permission in needed_permissions:
+                if permission not in token_scopes:
+                    missing_permissions.append(permission)
+            
+            if missing_permissions:
+                logger.error("=" * 100)
+                logger.error("ОШИБКА: У токена отсутствуют необходимые права доступа!")
+                logger.error("Недостающие права:")
+                for perm in missing_permissions:
+                    logger.error(f"  - {perm}")
+                logger.error("=" * 100)
+                return False, False
+
+            logger.info("✓ Все необходимые права доступа присутствуют")
+            logger.info(f"✓ Доступ к организации {org_id} подтвержден")
+            return False, True
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка при парсинге ответа от API: {e}")
+            return False, result
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при проверке прав доступа: {type(e).__name__}: {e}")
+            return False, result
+
+def check_token_permissions_for_service_application(settings: "SettingParams") -> bool:
+    """
+    Проверяет наличие прав для управления сервисными приложениями.
+    
+    Проверяет, что токен выдан личной учетке Яндекс (не организационной)
+    и содержит права на чтение и запись сервисных приложений.
+    
+    Args:
+        settings: Объект настроек с oauth_token и organization_id
+        
+    Returns:
+        bool: True если все права присутствуют, False в противном случае
+    """
+    needed_permissions = ["ya360_security:service_applications_read",
+                          "ya360_security:service_applications_write",]
+
+    result, data = check_token_permissions_api(settings.oauth_token, settings.organization_id, needed_permissions)
+    if not result:
+        return False
+    else:
+        try:
+            token_scopes = data.get('scopes', [])
+            token_org_ids = data.get('orgIds', [])
+            login = data.get('login', 'unknown')
+            if "@" in login:
+                logger.error("ОШИБКА: Токен выписан НЕ личной учётке Яндекс. Невозможно настроить сервисное приложение.")
+                return False
+
+            logger.info(f"Проверка прав доступа для токена пользователя: {login}")
+            logger.debug(f"Доступные права: {token_scopes}")
+            logger.debug(f"Доступные организации: {token_org_ids}")
+
+            for permission in needed_permissions:
+                if permission not in token_scopes:
+                    logger.error(f"ОШИБКА: Токен не имеет права {permission}. Невозможно настроить сервисное приложение.")
+                    return False
+
+            logger.info("✓ Все необходимые права доступа для создания сервисного приложения присутствуют.")
+            logger.info(f"✓ Доступ к организации {settings.organization_id} подтвержден")
+            return True
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при проверке прав доступа: {type(e).__name__}: {e}")
+            return False
+
+def check_token_permissions_api(token: str) -> tuple[bool, dict]:
     """
     Проверяет права доступа для заданного токена.
     
     Args:
         token: OAuth токен для проверки
-        org_id: ID организации
-        needed_permissions: Список необходимых прав доступа
         
     Returns:
-        bool: True если токен невалидный, False в противном случае, продолжение работы невозможно
-        bool: True если все права присутствуют и org_id совпадает, False в противном случае, продолжение работы возможно
+        bool: Статус выполнения запроса
+        dict: Данные ответа от API
     """
     url = 'https://api360.yandex.net/whoami'
     headers = {
         'Authorization': f'OAuth {token}'
     }
-    hard_error = False
+
+    result = None
     try:
-        response = requests.get(url, headers=headers)
+        with httpx.Client(headers=headers) as client:
+            response = client.get(url)
         
         # Проверка валидности токена
         if response.status_code != HTTPStatus.OK:
@@ -3591,61 +4250,683 @@ def check_token_permissions(token: str, org_id: int, needed_permissions: list) -
                 logger.error("Токен недействителен или истек срок его действия.")
             else:
                 logger.error(f"Ошибка при проверке токена: {response.text}")
-            return True, False
+            return False, result
         
         data = response.json()
+        return True, data
         
-        # Извлечение scopes и orgIds из ответа
-        token_scopes = data.get('scopes', [])
-        token_org_ids = data.get('orgIds', [])
-        login = data.get('login', 'unknown')
-        
-        logger.info(f"Проверка прав доступа для токена пользователя: {login}")
-        logger.debug(f"Доступные права: {token_scopes}")
-        logger.debug(f"Доступные организации: {token_org_ids}")
-        
-        # Проверка наличия org_id в списке доступных организаций
-        if str(org_id) not in [str(org) for org in token_org_ids]:
-            logger.error("=" * 100)
-            logger.error(f"ОШИБКА: Токен не имеет доступа к организации с ID {org_id}")
-            logger.error(f"Доступные организации для этого токена: {token_org_ids}")
-            logger.error("=" * 100)
-            return True, False
-
-        # Проверка наличия всех необходимых прав
-        missing_permissions = []
-        for permission in needed_permissions:
-            if permission not in token_scopes:
-                missing_permissions.append(permission)
-        
-        if missing_permissions:
-            logger.error("=" * 100)
-            logger.error("ОШИБКА: У токена отсутствуют необходимые права доступа!")
-            logger.error("Недостающие права:")
-            for perm in missing_permissions:
-                logger.error(f"  - {perm}")
-            logger.error("=" * 100)
-            return False, False
-
-        logger.info("✓ Все необходимые права доступа присутствуют")
-        logger.info(f"✓ Доступ к организации {org_id} подтвержден")
-        return False, True
-        
-    except requests.exceptions.RequestException as e:
+    except httpx.HTTPError as e:
         logger.error(f"Ошибка при выполнении запроса к API: {e}")
-        return True, False
+        return False, result
     except json.JSONDecodeError as e:
         logger.error(f"Ошибка при парсинге ответа от API: {e}")
-        return True, False
+        return False, result
     except Exception as e:
         logger.error(f"Неожиданная ошибка при проверке прав доступа: {type(e).__name__}: {e}")
-        return True, False
+        return False, result
 
 class TokenError(RuntimeError):
     pass
 
+def activate_service_applications(settings: "SettingParams") -> bool:
+    """
+    Активирует работу сервисных приложений.
+    Спецификация API: https://yandex.ru/dev/api360/doc/ru/ref/ServiceApplicationsService/ServiceApplicationsService_Activate
+    
+    Args:
+        settings: Объект настроек с oauth_token и organization_id
+        
+    Returns:
+        bool: True если функция активирована, False в случае ошибки
+    """
+    url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/service_applications/activate"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    retries = 0
+    try:
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"POST URL - {url}")
+                response = client.post(url)
+                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"Ошибка при активации сервисных приложений: {response.status_code}. Сообщение: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error("Превышено максимальное количество попыток.")
+                        return False
+                else:
+                    logger.info("Сервисные приложения активированы.")
+                    return True
+    except httpx.HTTPError as e:
+        logger.error(f"Ошибка при выполнении запроса к API: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при активации сервисных приложений: {type(e).__name__}: {e}")
+        return False
+
+def get_service_applications(settings: "SettingParams") -> Optional[list]:
+    """
+    Получает список сервисных приложений организации.
+    Спецификация API: https://yandex.ru/dev/api360/doc/ru/ref/ServiceApplicationsService/ServiceApplicationsService_Get
+    
+    Args:
+        settings: Объект настроек с oauth_token и organization_id
+        
+    Returns:
+        list: Список сервисных приложений, None в случае ошибки
+    """
+    url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/service_applications"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    retries = 0
+    try:
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"GET URL - {url}")
+                response = client.get(url)
+                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                if response.status_code != HTTPStatus.OK.value:
+                    if response.json()['message'] == 'feature is not active':
+                        logger.error('Функционал сервисных приложений не активирован в организации.')
+                        return None, response.json()['message']
+                    if response.json()['message'] == 'Not an owner':
+                        logger.error('Токен в параметре OAUTH_TOKEN_ARG выписан НЕ ВЛАДЕЛЬЦЕМ организации (с учеткой в @yandex.ru).')
+                        logger.error('Невозможно настроить сервисное приложение. Получите правильный токен и повторите попытку.')
+                        return None, response.json()['message']
+                    logger.error(f"Ошибка при получении списка сервисных приложений: {response.status_code}. Сообщение: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error("Превышено максимальное количество попыток.")
+                        return None, response.json()['message']
+                else:
+                    applications = response.json().get("applications", [])
+                    logger.info(f"Получен список {len(applications)} сервисных приложений.")
+                    return applications, None
+    except httpx.HTTPError as e:
+        logger.error(f"Ошибка при выполнении запроса к API: {e}")
+        return None, f'{e.__class__.__name__}: {e}'  
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка при парсинге ответа от API: {e}")
+        return None, f'{e.__class__.__name__}: {e}'  
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при получении сервисных приложений: {type(e).__name__}: {e}")
+        return None, f'{e.__class__.__name__}: {e}'     
+
+def export_service_applications_api_data(settings: "SettingParams") -> bool:
+    """
+    Выгружает ответ API сервисных приложений в файл.
+    Спецификация API: https://yandex.ru/dev/api360/doc/ru/ref/ServiceApplicationsService/ServiceApplicationsService_Get
+    """
+    if not settings.service_app_api_data_file:
+        logger.error("SERVICE_APP_API_DATA_FILE не задан. Невозможно сохранить данные.")
+        return False
+
+    applications, error_message = get_service_applications(settings)
+    if applications is None:
+        logger.error("Не удалось получить данные API сервисных приложений. Проверьте настройки и повторите попытку.")
+        return False
+    if not applications:
+        logger.error("Список сервисных приложений пуст. Невозможно выгрузить данные.")
+        return False
+    if len(applications) == 0:
+        logger.error("Список сервисных приложений пуст. Невозможно выгрузить данные.")
+        return False
+
+    data = {"applications": applications}
+    target_dir = os.path.dirname(settings.service_app_api_data_file)
+    if target_dir and not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+    base_name = os.path.basename(settings.service_app_api_data_file)
+    name_root, ext = os.path.splitext(base_name)
+    timestamp = datetime.now().strftime("%d%m%y_%H%M%S")
+    output_filename = f"{name_root}_{timestamp}{ext}"
+    output_path = os.path.join(target_dir, output_filename) if target_dir else output_filename
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(data, file, ensure_ascii=False, indent=2)
+        logger.info(
+            f"Данные API сервисных приложений сохранены в файл: {output_path} "
+            f"(кол-во приложений: {len(applications)})"
+        )
+    return True
+
+
+def import_service_applications_api_data(settings: "SettingParams") -> bool:
+    """
+    Загружает параметры сервисных приложений из файла и отправляет в API.
+    Спецификация API: https://yandex.ru/dev/api360/doc/ru/ref/ServiceApplicationsService/ServiceApplicationsService_Create
+    """
+    if not settings.service_app_api_data_file:
+        logger.error("SERVICE_APP_API_DATA_FILE не задан. Невозможно загрузить данные.")
+        return False
+
+    if not os.path.exists(settings.service_app_api_data_file):
+        logger.error(f"Файл не найден: {settings.service_app_api_data_file}")
+        return False
+
+    try:
+        with open(settings.service_app_api_data_file, "r", encoding="utf-8") as file:
+            raw_content = file.read()
+    except OSError as e:
+        logger.error(f"Ошибка при чтении файла {settings.service_app_api_data_file}: {e}")
+        return False
+
+    if not raw_content.strip():
+        logger.error(f"Файл пустой: {settings.service_app_api_data_file}")
+        return False
+
+    try:
+        payload = json.loads(raw_content)
+    except json.JSONDecodeError as e:
+        logger.error(f"Некорректный JSON в файле {settings.service_app_api_data_file}: {e}")
+        return False
+
+    if not isinstance(payload, dict) or "applications" not in payload:
+        logger.error("Некорректный формат данных: отсутствует ключ applications.")
+        return False
+
+    if not isinstance(payload["applications"], list):
+        logger.error("Некорректный формат данных: applications должен быть списком.")
+        return False
+
+    CHECK_TOKEN_PERMISSIONS = ["ya360_security:service_applications_read",
+                               "ya360_security:service_applications_write",]
+    success, data = check_token_permissions_api(settings.oauth_token)
+    if not success:
+        logger.error("Не удалось проверить токен (параметр OAUTH_TOKEN_ARG). Проверьте настройки.")
+        return False
+    token_scopes = data.get('scopes', [])
+    for permission in CHECK_TOKEN_PERMISSIONS:
+        if permission not in token_scopes:
+            logger.error(f"В токене OAUTH_TOKEN_ARG отсутствуют необходимые права доступа ({', '.join(CHECK_TOKEN_PERMISSIONS)}) для модификации списка сервисных приложений. Проверьте настройки и повторите попытку.")
+            return False
+
+    url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/service_applications"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    retries = 0
+    activated = False
+    try:
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"POST URL - {url}")
+                response = client.post(url, json=payload)
+                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                if response.status_code != HTTPStatus.OK.value:
+                    if response.json()['message'] == 'feature is not active':
+                        if not activated:
+                            logger.error('Функционал сервисных приложений не активирован в организации. Выполняем активацию...')
+                            result = activate_service_applications(settings)
+                            if not result:
+                                logger.error("Не удалось активировать функционал сервисных приложений. Проверьте настройки и повторите попытку.")
+                                return False
+                            activated = True
+                            time.sleep(RETRIES_DELAY_SEC)
+                        else:
+                            logger.error('Функционал сервисных приложений не активирован в организации. Проверьте настройки и повторите попытку.')
+                            return False
+                    if response.json()['message'] == 'Not an owner':
+                        logger.error('Токен в параметре OAUTH_TOKEN_ARG выписан НЕ ВЛАДЕЛЬЦЕМ организации (с учеткой в @yandex.ru).')
+                        logger.error('Невозможно настроить сервисное приложение. Получите правильный токен и повторите попытку.')
+                        return False
+                    logger.error(f"Ошибка при загрузке сервисных приложений из файла: {response.status_code}. Сообщение: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error("Превышено максимальное количество попыток.")
+                        return False
+                else:
+                    app_count = len(payload.get("applications", []))
+                    logger.info(f"Данные сервисных приложений успешно загружены из файла (кол-во приложений: {app_count}).")
+                    return True
+    except httpx.HTTPError as e:
+        logger.error(f"Ошибка при выполнении запроса к API: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при загрузке сервисных приложений из файла: {type(e).__name__}: {e}")
+        return False
+
+
+def merge_service_app_permissions(existing_permissions: list, required_permissions: list) -> list:
+    """
+    Объединяет существующие разрешения сервисного приложения с требуемыми.
+    
+    Args:
+        existing_permissions: Текущий список разрешений
+        required_permissions: Список необходимых разрешений для добавления
+        
+    Returns:
+        list: Объединенный список разрешений без дубликатов
+    """
+    merged_permissions = list(existing_permissions) if existing_permissions else []
+    existing_set = set(merged_permissions)
+    for permission in required_permissions:
+        if permission not in existing_set:
+            merged_permissions.append(permission)
+            existing_set.add(permission)
+    return merged_permissions
+
+def setup_service_application(settings: "SettingParams") -> bool:
+    """
+    Добавляет/обновляет сервисное приложение и его разрешения.
+    Спецификация API: https://yandex.ru/dev/api360/doc/ru/ref/ServiceApplicationsService/ServiceApplicationsService_Create
+    
+    Args:
+        settings: Объект настроек с oauth_token, organization_id и application_client_id
+        
+    Returns:
+        bool: True если операция успешна или не требуется, False в случае ошибки
+    """
+    if not settings.application_client_id:
+        logger.error("application_client_id не задан. Невозможно настроить сервисное приложение.")
+        return False
+
+    if not settings.application_client_secret:
+        logger.error("application_client_secret не задан. Невозможно проверить статус сервисного приложения.")
+        return False
+
+    CHECK_TOKEN_PERMISSIONS = ["ya360_security:service_applications_read",
+                               "ya360_security:service_applications_write",]
+    success, data = check_token_permissions_api(settings.oauth_token)
+    if not success:
+        logger.error("Не удалось проверить токен (параметр OAUTH_TOKEN_ARG). Проверьте настройки.")
+        return False
+    token_scopes = data.get('scopes', [])
+    for permission in CHECK_TOKEN_PERMISSIONS:
+        if permission not in token_scopes:
+            logger.error(f"В токене OAUTH_TOKEN_ARG отсутствуют необходимые права доступа ({', '.join(CHECK_TOKEN_PERMISSIONS)}) для модификации списка сервисных приложений. Проверьте настройки и повторите попытку.")
+            return False
+    
+    applications, error_message = get_service_applications(settings)
+    if applications is None:
+        if error_message == 'feature is not active':
+            result = activate_service_applications(settings)
+            if not result:
+                logger.error("Не удалось активировать функционал сервисных приложений. Проверьте настройки и повторите попытку.")
+                return False
+        else:
+            return False
+
+    client_id = settings.application_client_id
+    required_permissions = SERVICE_APP_PERMISSIONS
+    changed = False
+    found = False
+
+    if applications:
+        for app in applications:
+            if app.get("id") == client_id:
+                found = True
+                logger.info(f"Сервисное приложение с ID {client_id} найдено в списке сервисных приложений организации.")
+                current_permissions = app.get("scopes", [])
+                merged_permissions = merge_service_app_permissions(current_permissions, required_permissions)
+                if merged_permissions != current_permissions:
+                    app["scopes"] = merged_permissions
+                    changed = True
+                    logger.info("Добавлены недостающие разрешения для сервисного приложения.")
+                else:
+                    logger.info("Сервисное приложение уже содержит все необходимые разрешения. Выполняем проверку валидности токена сервисного приложения...")
+                    check_service_app_status(settings)
+                break
+    else:
+        applications = []
+
+    if not found:
+        applications.append({
+            "id": client_id,
+            "scopes": list(required_permissions)
+        })
+        changed = True
+        logger.info(f"Сервисное приложение с ID {client_id} не найдено в списке сервисных приложений организации. Создаем новое.")
+
+    if not changed:
+        return True
+
+    url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/service_applications"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    payload = {"applications": applications}
+    retries = 0
+    try:
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"POST URL - {url}")
+                response = client.post(url, json=payload)
+                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"Ошибка при обновлении сервисных приложений: {response.status_code}. Сообщение: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error("Превышено максимальное количество попыток.")
+                        return False
+                else:
+                    logger.info(f"Список сервисных приложений успешно обновлен (Client ID - {client_id}).")
+                    break
+    except httpx.HTTPError as e:
+        logger.error(f"Ошибка при выполнении запроса к API: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при обновлении сервисных приложений: {type(e).__name__}: {e}")
+        return False
+
+    logger.info(f"Сервисное приложение с ID {client_id} успешно настроено. Выполняем проверку валидности токена сервисного приложения...")
+    check_service_app_status(settings)
+    
+def delete_service_applications_list(settings: "SettingParams") -> bool:
+    """
+    Очищает список сервисных приложений организации.
+    Спецификация API: https://yandex.ru/dev/api360/doc/ru/ref/ServiceApplicationsService/ServiceApplicationsService_Delete
+    """
+    url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/service_applications"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    retries = 0
+    try:
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"DELETE URL - {url}")
+                response = client.delete(url)
+                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"Ошибка при очистке списка сервисных приложений: {response.status_code}. Сообщение: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error("Превышено максимальное количество попыток.")
+                        return False
+                else:
+                    logger.info("Список сервисных приложений успешно очищен.")
+                    return True
+    except httpx.HTTPError as e:
+        logger.error(f"Ошибка при выполнении запроса к API: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при очистке списка сервисных приложений: {type(e).__name__}: {e}")
+        return False
+
+def deactivate_service_applications(settings: "SettingParams") -> bool:
+    """
+    Деактивирует функцию сервисных приложений.
+    Спецификация API: https://yandex.ru/dev/api360/doc/ru/ref/ServiceApplicationsService/ServiceApplicationsService_Deactivate
+    """
+    url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/service_applications/deactivate"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    retries = 0
+    try:
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"POST URL - {url}")
+                response = client.post(url)
+                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"Ошибка при деактивации сервисных приложений: {response.status_code}. Сообщение: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error("Превышено максимальное количество попыток.")
+                        return False
+                else:
+                    logger.info("Сервисные приложения деактивированы.")
+                    return True
+    except httpx.HTTPError as e:
+        logger.error(f"Ошибка при выполнении запроса к API: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при деактивации сервисных приложений: {type(e).__name__}: {e}")
+        return False
+
+def delete_service_application_from_list(settings: "SettingParams") -> bool:
+    """
+    Удаляет сервисное приложение с application_client_id из списка организации.
+    Если приложение единственное, очищает список и деактивирует функцию.
+    """
+    if not settings.application_client_id:
+        logger.error("application_client_id не задан. Невозможно удалить сервисное приложение.")
+        return False
+
+    CHECK_TOKEN_PERMISSIONS = ["ya360_security:service_applications_read",
+                               "ya360_security:service_applications_write",]
+    success, data = check_token_permissions_api(settings.oauth_token)
+    if not success:
+        logger.error("Не удалось проверить токен (параметр OAUTH_TOKEN_ARG). Проверьте настройки.")
+        return False
+    token_scopes = data.get('scopes', [])
+    for permission in CHECK_TOKEN_PERMISSIONS:
+        if permission not in token_scopes:
+            logger.error(f"В токене OAUTH_TOKEN_ARG отсутствуют необходимые права доступа ({', '.join(CHECK_TOKEN_PERMISSIONS)}) для модификации списка сервисных приложений. Проверьте настройки и повторите попытку.")
+            return False
+
+    applications, error_message = get_service_applications(settings)
+    if applications is None:
+        if error_message == 'feature is not active':
+            return True
+        else:
+            return False
+
+    if not applications:
+        logger.info("Список сервисных приложений пуст. Нечего удалять.")
+        return True
+
+    client_id = settings.application_client_id
+    found = [app for app in applications if app.get("id") == client_id]
+    if not found:
+        logger.info(f"Сервисное приложение с ID {client_id} не найдено в списке сервисных приложений организации.")
+        return False
+
+    new_applications = [app for app in applications if app.get("id") != client_id]
+    if not new_applications:
+        logger.info("В списке осталось только удаляемое приложение. Очищаем список и деактивируем функцию.")
+        if not delete_service_applications_list(settings):
+            return False
+        return deactivate_service_applications(settings)
+
+    url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/service_applications"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    payload = {"applications": new_applications}
+    retries = 0
+    try:
+        with httpx.Client(headers=headers) as client:
+            while True:
+                logger.debug(f"POST URL - {url}")
+                response = client.post(url, json=payload)
+                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"Ошибка при обновлении списка сервисных приложений: {response.status_code}. Сообщение: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        logger.error("Превышено максимальное количество попыток.")
+                        return False
+                else:
+                    logger.info(f"Сервисное приложение с ID {client_id} удалено из списка сервисных приложений организации.")
+                    return True
+    except httpx.HTTPError as e:
+        logger.error(f"Ошибка при выполнении запроса к API: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при обновлении списка сервисных приложений: {type(e).__name__}: {e}")
+        return False
+
+def check_service_app_status(settings: "SettingParams", skip_permissions_check: bool = False) -> bool:
+    """
+    Проверяет статус и корректность настройки сервисного приложения.
+    
+    Выполняет проверку наличия приложения в списке организации,
+    получает тестовый токен пользователя и проверяет его права.
+    
+    Args:
+        settings: Объект настроек с application_client_id и application_client_secret
+        skip_permissions_check: Пропустить проверку прав OAuth-токена (по умолчанию False)
+        
+    Returns:
+        bool: True если приложение настроено корректно, False при ошибке
+    """
+    if not settings.application_client_id:
+        logger.error("Параметр APPLICATION_CLIENT_ID_ARG не задан. Невозможно проверить статус сервисного приложения.")
+        return False
+    if not settings.application_client_secret:
+        logger.error("Параметр APPLICATION_CLIENT_SECRET_ARG не задан. Невозможно проверить статус сервисного приложения.")
+        return False
+
+    if not skip_permissions_check:
+        CHECK_TOKEN_PERMISSIONS = ["ya360_security:service_applications_read",]
+        success, data = check_token_permissions_api(settings.oauth_token)
+        if not success:
+            logger.error("Не удалось проверить токен (параметр OAUTH_TOKEN_ARG). Проверьте настройки.")
+            return False
+        token_scopes = data.get('scopes', [])
+        for permission in CHECK_TOKEN_PERMISSIONS:
+            if permission not in token_scopes:
+                logger.error(f"В токене OAUTH_TOKEN_ARG отсутствуют необходимые права доступа ({', '.join(CHECK_TOKEN_PERMISSIONS)}) для чтения списка сервисных приложений. Проверьте настройки и повторите попытку.")
+                return False
+
+        applications, error_message = get_service_applications(settings)
+        if applications is None:
+            if error_message == 'feature is not active':
+                settings.service_app_status = False
+                return False
+            else:
+                settings.service_app_status = False
+                return False
+
+    # получаем первую страницу списка пользователей
+    logger.info("Получение первой страницы списка всех пользователей организации из API...")
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.organization_id}/users"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    has_errors = False
+    users = []
+    current_page = 1
+    params = {'page': current_page, 'perPage': USERS_PER_PAGE_FROM_API}
+    try:
+        retries = 1
+        while True:
+            logger.debug(f"GET URL - {url}")
+            with httpx.Client(headers=headers) as client:
+                response = client.get(url, params=params)
+            logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
+            if response.status_code != HTTPStatus.OK.value:
+                logger.error(f"!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                if retries < MAX_RETRIES:
+                    logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    retries += 1
+                else:
+                    has_errors = True
+                    break
+            else:
+                for user in response.json()['users']:
+                    if not user.get('isRobot') and int(user["id"]) >= 1130000000000000:
+                        users.append(user)
+                logger.debug(f"Загружено {len(response.json()['users'])} пользователей.")
+                break
+
+    except httpx.HTTPError as e:
+        logger.error(f"!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+        has_errors = True
+
+    if has_errors:
+        return False
+
+    if len(users) == 0:
+        logger.error("Не найдено ни одного пользователя в организации. Невозможно проверить статус сервисного приложения.")
+        return False
+
+    for u in users:
+        if u["isEnabled"]:
+            user = u
+            break
+    if not user:
+        logger.error("Не найдено ни одного пользователя в организации. Невозможно проверить статус сервисного приложения.")
+        return False
+    user_email = user.get('email', '')
+    try:
+        user_token = get_service_app_token(settings, user_email)
+        #user_token = get_user_token(user_email, settings)
+    except Exception as e:
+        logger.error("Не удалось получить тестовый токен пользователя.")
+        settings.service_app_status = False
+        return False
+
+    success, data = check_token_permissions_api(user_token)
+    if not success:
+        logger.error("Не удалось проверить токен пользователя. Проверьте настройки сервисного приложения.")
+        return False
+    token_scopes = data.get('scopes', [])
+    token_org_ids = data.get('orgIds', [])
+    login = data.get('login', 'unknown')
+
+    logger.debug(f"Проверка прав доступа для токена пользователя: {login}")
+    logger.debug(f"Доступные права: {token_scopes}")
+    logger.debug(f"Доступные организации: {token_org_ids}")
+
+    for permission in SERVICE_APP_PERMISSIONS:
+        if permission not in token_scopes:
+            logger.error(f"В токене пользователя отсутствуют необходимые права доступа {', '.join(SERVICE_APP_PERMISSIONS)}. Проверьте настройки сервисного приложения и повторите попытку.")
+            settings.service_app_status = False
+            return False
+
+    logger.info("Сервисное приложение настроено корректно.")
+    settings.service_app_status = True
+    return True
+
+def get_user_token(user_mail: str, settings: "SettingParams"):
+    """
+    Получает OAuth-токен пользователя через Token Exchange.
+    
+    Использует сервисное приложение для получения токена от имени пользователя.
+    
+    Args:
+        user_mail: Email пользователя для получения токена
+        settings: Объект настроек с application_client_id и application_client_secret
+        
+    Returns:
+        str: OAuth-токен пользователя или пустая строка при ошибке
+    """
+    logger.debug(f"Getting user token for {user_mail}")
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "client_id": settings.application_client_id,
+        "client_secret": settings.application_client_secret,
+        "subject_token": user_mail,
+        "subject_token_type": "urn:yandex:params:oauth:token-type:email",
+    }
+    with httpx.Client(headers=headers) as client:
+        response = client.post(url=DEFAULT_OAUTH_API_URL, data=data)
+
+    if response.status_code != HTTPStatus.OK.value:
+        logger.error(f"Error during getiing user token. Response: {response.status_code}, reason: {response.reason_phrase}, error: {response.text}")
+        return ''
+    else:
+        logger.debug(f"User token for {user_mail} received successfully - {response.json()['access_token']}")
+        return response.json()["access_token"]   
+
 def fetch_audit_logs(settings: "SettingParams"):
-  
+    """
+    Получает записи почтового журнала аудита из API Яндекс 360.
+    
+    Загружает события за период, определенный в search_param (message_date и days_diff).
+    Использует постраничную загрузку с автоматическим сдвигом дат.
+    
+    Args:
+        settings: Объект настроек с oauth_token, organization_id и search_param
+        
+    Returns:
+        tuple: (error: bool, records: list) - флаг ошибки и список записей аудит-лога
+    """
     log_records = set()
     params = {}
     error = False
@@ -3668,52 +4949,53 @@ def fetch_audit_logs(settings: "SettingParams"):
         headers = {"Authorization": f"OAuth {settings.oauth_token}"}
         pages_count = 0
         retries = 0
-        while True:           
-            response = requests.get(url, headers=headers, params=params)
-            if response.status_code != HTTPStatus.OK.value:
-                logger.error(f"Ошибка при GET запросе: {response.status_code}. Сообщение об ошибке: {response.text}")
-                logger.debug(f"Ошибка при GET запросе. url - {url}. Параметры - {params}")
-                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
-                if retries < MAX_RETRIES:
-                    logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
-                    retries += 1
-                else:
-                    logger.error("Принудительный выход без получения данных.")
-                    error = True
-                    return []
-            else:
-                retries = 1
-                temp_list = response.json()["events"]
-                if not temp_list:
-                    logger.error("GET запрос вернул пустой ответ. Выход из цикла сбора журнала.")
-                    break
-                sorted_list = sorted(temp_list, key=lambda x: x["date"], reverse=True)
-                if temp_list:
-                    logger.debug(f'Получено {len(sorted_list)} записей, с {sorted_list[-1]["date"]} по {sorted_list[0]["date"]}')
-                    temp_json = [json.dumps(d, ensure_ascii=False).encode('utf8') for d in sorted_list]
-                    log_records.update(temp_json)
-                
-                if response.json()["nextPageToken"] == "":
-                    break
-                else:
-                    if pages_count < OLD_LOG_MAX_PAGES:
-                        pages_count += 1
-                        params["pageToken"] = response.json()["nextPageToken"]
+        with httpx.Client(headers=headers) as client:
+            while True:           
+                response = client.get(url, params=params)
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"Ошибка при GET запросе: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    logger.debug(f"Ошибка при GET запросе. url - {url}. Параметры - {params}")
+                    logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
                     else:
-                        if params.get('pageToken') : del params['pageToken']
-                        if temp_list:
-                            sugested_date = sorted_list[-1]["date"][0:19] + "Z"
-                            msg_date = datetime.strptime(sugested_date, "%Y-%m-%dT%H:%M:%SZ")
-                            shifted_date = msg_date + relativedelta(seconds=OVERLAPPED_SECONDS)
-                            params["beforeDate"] = shifted_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        logger.error("Принудительный выход без получения данных.")
+                        error = True
+                        return []
+                else:
+                    retries = 1
+                    temp_list = response.json()["events"]
+                    if not temp_list:
+                        logger.error("GET запрос вернул пустой ответ. Выход из цикла сбора журнала.")
+                        break
+                    sorted_list = sorted(temp_list, key=lambda x: x["date"], reverse=True)
+                    if temp_list:
+                        logger.debug(f'Получено {len(sorted_list)} записей, с {sorted_list[-1]["date"]} по {sorted_list[0]["date"]}')
+                        temp_json = [json.dumps(d, ensure_ascii=False).encode('utf8') for d in sorted_list]
+                        log_records.update(temp_json)
+                    
+                    if response.json()["nextPageToken"] == "":
+                        break
+                    else:
+                        if pages_count < OLD_LOG_MAX_PAGES:
+                            pages_count += 1
+                            params["pageToken"] = response.json()["nextPageToken"]
                         else:
-                            logger.error("API запрос вернул пустой ответ. Выход из цикла.")
-                            logger.debug(f"Данные для GET запроса: url - {url}. Параметры - {params}")
-                            logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
-                            break
-                        params["pageSize"] = 100
-                        pages_count = 0
+                            if params.get('pageToken') : del params['pageToken']
+                            if temp_list:
+                                sugested_date = sorted_list[-1]["date"][0:19] + "Z"
+                                msg_date = datetime.strptime(sugested_date, "%Y-%m-%dT%H:%M:%SZ")
+                                shifted_date = msg_date + relativedelta(seconds=OVERLAPPED_SECONDS)
+                                params["beforeDate"] = shifted_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            else:
+                                logger.error("API запрос вернул пустой ответ. Выход из цикла.")
+                                logger.debug(f"Данные для GET запроса: url - {url}. Параметры - {params}")
+                                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                                break
+                            params["pageSize"] = 100
+                            pages_count = 0
 
     except Exception as e:
         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
@@ -3730,6 +5012,16 @@ def fetch_audit_logs(settings: "SettingParams"):
     return error, parsed_records
 
 def WriteToFile(data, filename):
+    """
+    Записывает список словарей в CSV-файл.
+    
+    Args:
+        data: Список словарей для записи
+        filename: Путь к файлу для сохранения
+        
+    Returns:
+        None
+    """
     with open(filename, 'w', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=data[0].keys(), delimiter=';')
 
@@ -3852,6 +5144,17 @@ def is_valid_date(date_string, min_years_diff=0, max_years_diff=20):
     return False, None
 
 def parse_to_dict(data: dict):
+    """
+    Преобразует запись аудит-лога в структурированный словарь.
+    
+    Извлекает основные поля события и форматирует дату.
+    
+    Args:
+        data: Словарь с данными события аудит-лога
+        
+    Returns:
+        dict: Структурированный словарь с полями eventType, date, userLogin и др.
+    """
     #obj = json.dumps(data)
     d = {}
     d["eventType"] = data.get("eventType",'')
@@ -3880,15 +5183,42 @@ def parse_to_dict(data: dict):
     return d
     
 def log_error(info="Error"):
+    """
+    Логирует сообщение с уровнем ERROR.
+    
+    Args:
+        info: Текст сообщения (по умолчанию "Error")
+    """
     logger.error(info)
 
 def log_info(info="Info"):
+    """
+    Логирует сообщение с уровнем INFO.
+    
+    Args:
+        info: Текст сообщения (по умолчанию "Info")
+    """
     logger.info(info)
 
 def log_debug(info="Debug"):
+    """
+    Логирует сообщение с уровнем DEBUG.
+    
+    Args:
+        info: Текст сообщения (по умолчанию "Debug")
+    """
     logger.debug(info)
 
 def map_folder(folder: Optional[bytes]) -> Optional[str]:
+    """
+    Преобразует байтовую строку папки IMAP в формат для использования в командах.
+    
+    Args:
+        folder: Байтовая строка с именем папки из IMAP LIST
+        
+    Returns:
+        str: Имя папки в кавычках или None для невалидных папок
+    """
     if not folder or folder == b"LIST Completed.":
         return None
     valid = folder.decode("ascii").split('"|"')[-1].strip().strip('""')
@@ -4068,8 +5398,8 @@ def restore_from_checkin_menu(settings: SettingParams):
     logger.info("\n" + "="*80)
     logger.info("ИТОГОВАЯ СТАТИСТИКА ВОССТАНОВЛЕНИЯ")
     logger.info("="*80)
-    logger.info(f"Всего записей для восстановления: {restore_stats['total']}")
-    logger.info(f"Обработано записей: {restore_stats['processed']}")
+    logger.info(f"Всего ящиков для восстановления: {restore_stats['total']}")
+    logger.info(f"Обработано ящиков: {restore_stats['processed']}")
     logger.info(f"Успешно восстановлено: {restore_stats['success']}")
     logger.info(f"Ошибок: {restore_stats['errors']}")
     logger.info("="*80)
@@ -4127,7 +5457,15 @@ def restore_from_checkin_menu(settings: SettingParams):
     input("\nНажмите Enter для продолжения...")
 
 def main_menu(settings: SettingParams):
-
+    """
+    Отображает главное меню приложения и обрабатывает выбор пользователя.
+    
+    Args:
+        settings: Объект настроек приложения
+        
+    Returns:
+        SettingParams: Обновленный объект настроек
+    """
     while True:
         print("\n")
         print("---------------------- Настройка параметров поиска ----------------------")
@@ -4152,12 +5490,13 @@ def main_menu(settings: SettingParams):
         print("1. Ввести параметры поиска вручную.")        
         print("2. Загрузка параметров из файла.")
         print("3. Восстановить конфигурацию почтовых ящиков из файла checkin.")
+        print("4. Проверить/настроить сервисное приложение для удаления сообщений.")
 
         # print("3. Delete all contacts.")
         # print("4. Output bad records to file")
         print("0. Выйти")
 
-        choice = input("Введите ваш выбор (0-3): ")
+        choice = input("Введите ваш выбор (0-4): ")
 
         if choice == "0":
             print("До свидания!")
@@ -4165,15 +5504,28 @@ def main_menu(settings: SettingParams):
         elif choice == "1":
             manually_search_params_menu(settings)
         elif choice == "2":
-            restore_from_checkin_menu(settings)
-        elif choice == "3":
             file_search_params_menu(settings)
+        elif choice == "3":
+            restore_from_checkin_menu(settings)
+        elif choice == "4":
+            service_application_status_menu(settings)
 
         else:
             print("Неверный выбор. Попробуйте снова.")
     return settings
 
 def manually_search_params_menu(settings: SettingParams):
+    """
+    Отображает меню ручного ввода параметров поиска и обрабатывает выбор пользователя.
+    
+    Позволяет задать ID сообщения, дату, временной диапазон и список почтовых ящиков.
+    
+    Args:
+        settings: Объект настроек приложения
+        
+    Returns:
+        SettingParams: Обновленный объект настроек
+    """
     while True:
         print("\n")
         print("-------------------------- Параметры поиска ---------------------------")
@@ -4237,6 +5589,17 @@ def manually_search_params_menu(settings: SettingParams):
     return settings
 
 def file_search_params_menu(settings: SettingParams):
+    """
+    Отображает меню загрузки параметров из файлов и обрабатывает выбор пользователя.
+    
+    Позволяет загружать списки ящиков и сообщений из CSV-файлов.
+    
+    Args:
+        settings: Объект настроек приложения
+        
+    Returns:
+        SettingParams: Обновленный объект настроек
+    """
     while True:
         print("\n")
         print("------------------------ Параметры из файлов ------------------------")
@@ -4268,7 +5631,56 @@ def file_search_params_menu(settings: SettingParams):
             print("Неверный выбор. Попробуйте снова.")
     return settings
 
+def service_application_status_menu(settings: SettingParams):
+    """
+    Отображает меню управления сервисным приложением.
+    
+    Позволяет проверять статус, настраивать, удалять и экспортировать/импортировать
+    данные сервисных приложений.
+    
+    Args:
+        settings: Объект настроек приложения
+        
+    Returns:
+        SettingParams: Обновленный объект настроек
+    """
+    while True:
+        print("\n")
+        print("------------------------ Сервисное приложение ------------------------")
+        print("1. Проверить статус сервисного приложения.")
+        print("2. Настроить сервисное приложение.")
+        print("3. Удаление сервисного приложения из списка организации.")
+        print("4. Выгрузить данные сервисных приложений в файл.")
+        print("5. Загрузить параметры сервисных приложений из файла.")
+        print("------------------------ Выйти в главное меню -------------------------")
+        print("0. Выйти в главное меню.")
+        choice = input("Введите ваш выбор (0-5): ")
+        if choice == "0" or choice == "":
+            break
+        elif choice == "1":
+            check_service_app_status(settings)
+        elif choice == "2":
+            setup_service_application(settings)
+        elif choice == "3":
+            delete_service_application_from_list(settings)
+        elif choice == "4":
+            export_service_applications_api_data(settings)
+        elif choice == "5":
+            import_service_applications_api_data(settings)
+        else:
+            print("Неверный выбор. Попробуйте снова.")
+    return settings
+
 def set_message_id(settings: SettingParams):
+    """
+    Запрашивает у пользователя ID сообщения и опционально дату.
+    
+    Args:
+        settings: Объект настроек приложения
+        
+    Returns:
+        SettingParams: Обновленный объект настроек с message_id
+    """
     answer = input("Введите ID сообщения и дату сообщения, разделенные пробелом (ПРОБЕЛ для очистки): ")
     if answer:
         if answer.strip() == "":
@@ -4284,6 +5696,16 @@ def set_message_id(settings: SettingParams):
     return settings
 
 def set_message_date(settings: SettingParams, input_date: str = ""):
+    """
+    Запрашивает у пользователя дату сообщения и валидирует ввод.
+    
+    Args:
+        settings: Объект настроек приложения
+        input_date: Предустановленная дата (опционально)
+        
+    Returns:
+        SettingParams: Обновленный объект настроек с message_date
+    """
     if not input_date:
         answer = input("Введите дату сообщения DD-MM-YYYY (ПРОБЕЛ для очистки): ")
     else:
@@ -4303,6 +5725,15 @@ def set_message_date(settings: SettingParams, input_date: str = ""):
     return settings
 
 def set_days_diff(settings: SettingParams):
+    """
+    Запрашивает у пользователя количество дней для расширения диапазона поиска.
+    
+    Args:
+        settings: Объект настроек приложения
+        
+    Returns:
+        SettingParams: Обновленный объект настроек с days_diff
+    """
     answer = input("Введите количество дней назад от целевого дня: ")
     if answer:
         if answer.isdigit():
@@ -4316,7 +5747,18 @@ def set_days_diff(settings: SettingParams):
     return settings
 
 def set_mailboxes(settings: SettingParams, use_file: bool = False):
-
+    """
+    Задает список почтовых ящиков для поиска сообщений.
+    
+    Позволяет вводить ящики вручную, загружать из файла или выбрать все ящики организации.
+    
+    Args:
+        settings: Объект настроек приложения
+        use_file: Загружать ящики из файла (по умолчанию False)
+        
+    Returns:
+        None (обновляет settings.search_param["mailboxes"])
+    """
     break_flag = False
     all_users_flag = False
     from_file_flag = False
@@ -4390,14 +5832,31 @@ def set_mailboxes(settings: SettingParams, use_file: bool = False):
     return 
 
 def find_users_prompt(settings: "SettingParams", answer = "") -> tuple[list[dict], bool, bool, bool, bool]:
+    """
+    Ищет пользователей и общие ящики по введенному запросу.
+    
+    Поддерживает поиск по email, алиасу, UID, фамилии. Специальные символы:
+    - "*" - выбрать все ящики
+    - "!" - загрузить из файла
+    - " " (пробел) - очистить список
+    
+    Args:
+        settings: Объект настроек приложения
+        answer: Предустановленный ответ (опционально)
+        
+    Returns:
+        tuple: (найденные_пользователи, break_flag, double_users_flag, all_users_flag, from_file_flag)
+    """
     break_flag = False
     double_users_flag = False
     from_file_flag = False
     users_to_add = settings.search_param["mailboxes"]
     all_users_flag = False
+    print("\nВведите email, алиас, UID ящиков для поиска, разделенных запятой или пробелом.")
+    print("Очистить список - ПРОБЕЛ, * - ВСЕ ЯЩИКИ, ! - ЗАГРУЗИТЬ ИЗ ФАЙЛА.")
     if not answer:
         answer = input(
-            "Введите email, алиас, UID ящиков для поиска, разделенных запятой или пробелом (очистить список - ПРОБЕЛ, * - ВСЕ ЯЩИКИ, ! - ЗАГРУЗИТЬ ИЗ ФАЙЛА):\n"
+            "Ящики для поиска: "
         )
 
     if answer == " ":
@@ -4495,7 +5954,20 @@ def find_users_prompt(settings: "SettingParams", answer = "") -> tuple[list[dict
     return users_to_add, break_flag, double_users_flag, all_users_flag, from_file_flag
 
 def read_mailboxes_csv(path: str) -> list[str]:
-    """Read mailboxes from CSV. Expects column 'Email' (case-insensitive)."""
+    """
+    Читает список почтовых ящиков из CSV-файла.
+    
+    Ищет колонку 'Email' (регистронезависимо) и возвращает список адресов.
+    
+    Args:
+        path: Путь к CSV-файлу
+        
+    Returns:
+        list[str]: Список email-адресов в нижнем регистре
+        
+    Raises:
+        FileNotFoundError: Если файл не найден
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"ФАЙЛ ПОЧТОВЫХ ЯЩИКОВ НЕ НАЙДЕН: {path}")
 
@@ -4512,6 +5984,21 @@ def read_mailboxes_csv(path: str) -> list[str]:
     return mailboxes_list
 
 def read_message_ids_csv(path: str) -> list[dict]:
+    """
+    Читает список сообщений для удаления из CSV-файла.
+    
+    Ищет колонки message_id/msgId, date/message_date и опционально days_diff.
+    Автоматически определяет разделитель (точка с запятой, запятая, табуляция).
+    
+    Args:
+        path: Путь к CSV-файлу
+        
+    Returns:
+        list[dict]: Список словарей с полями message_id, message_date, days_diff
+        
+    Raises:
+        FileNotFoundError: Если файл не найден
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"ФАЙЛ MESSAGE IDS НЕ НАЙДЕН: {path}")
 
@@ -4570,6 +6057,18 @@ def read_message_ids_csv(path: str) -> list[dict]:
     return messages
 
 def load_search_params_from_files(settings: SettingParams):
+    """
+    Загружает параметры поиска из файлов mailboxes_list и message_ids.
+    
+    Читает список ящиков и сообщений из соответствующих CSV-файлов,
+    валидирует данные и сохраняет в search_param.
+    
+    Args:
+        settings: Объект настроек приложения
+        
+    Returns:
+        SettingParams: Обновленный объект настроек
+    """
     try:
         source_emails = read_mailboxes_csv(settings.mailboxes_list_file)
     except FileNotFoundError as e:
@@ -4612,6 +6111,19 @@ def load_search_params_from_files(settings: SettingParams):
     return settings
 
 def fetch_audit_logs_for_message(settings: "SettingParams", message_date: str, days_diff: int):
+    """
+    Получает записи аудит-лога для конкретного сообщения.
+    
+    Временно подменяет параметры поиска в settings и вызывает fetch_audit_logs.
+    
+    Args:
+        settings: Объект настроек приложения
+        message_date: Дата сообщения в формате "DD-MM-YYYY"
+        days_diff: Количество дней для расширения диапазона поиска
+        
+    Returns:
+        tuple: (error: bool, records: list) - результат fetch_audit_logs
+    """
     original_message_date = settings.search_param.get("message_date", "")
     original_days_diff = settings.search_param.get("days_diff", DEFAULT_DAYS_DIF)
     settings.search_param["message_date"] = message_date
@@ -4623,6 +6135,19 @@ def fetch_audit_logs_for_message(settings: "SettingParams", message_date: str, d
         settings.search_param["days_diff"] = original_days_diff
 
 def delete_messages_from_files(settings: SettingParams, use_log=True):
+    """
+    Удаляет сообщения на основе данных, загруженных из файлов.
+    
+    Использует список сообщений из search_param["messages_to_delete"].
+    Может определять целевые ящики из журнала аудита или использовать заранее заданный список.
+    
+    Args:
+        settings: Объект настроек приложения
+        use_log: Использовать журнал аудита для определения ящиков (по умолчанию True)
+        
+    Returns:
+        SettingParams: Обновленный объект настроек
+    """
     messages_to_delete = settings.search_param.get("messages_to_delete", [])
     if not messages_to_delete:
         logger.error("Список сообщений не загружен. Сначала загрузите параметры из файлов.")
@@ -4764,6 +6289,15 @@ def delete_messages_from_files(settings: SettingParams, use_log=True):
     return settings
 
 def clear_mailboxes(settings: SettingParams):
+    """
+    Очищает список почтовых ящиков для поиска после подтверждения пользователя.
+    
+    Args:
+        settings: Объект настроек приложения
+        
+    Returns:
+        SettingParams: Обновленный объект настроек
+    """
     answer = input("Очистить список ящиков? (Y/n): ")
     if answer.upper() not in ["Y", "YES"]:
         return settings
@@ -4772,6 +6306,17 @@ def clear_mailboxes(settings: SettingParams):
     return settings
 
 def clear_search_params(settings: SettingParams):
+    """
+    Очищает все параметры поиска после подтверждения пользователя.
+    
+    Сбрасывает mailboxes, message_id, message_date, days_diff и messages_to_delete.
+    
+    Args:
+        settings: Объект настроек приложения
+        
+    Returns:
+        SettingParams: Обновленный объект настроек с очищенными параметрами
+    """
     answer = input("Очистить параметры поиска? (Y/n): ")
     if answer.upper() not in ["Y", "YES"]:
         return settings
@@ -4916,6 +6461,19 @@ def print_final_report(message_id: str, mailboxes_data: list, results: list):
     logger.info("")
 
 def delete_messages(settings: SettingParams, use_log=True):
+    """
+    Выполняет удаление сообщения по ID из почтовых ящиков.
+    
+    Валидирует параметры поиска, при необходимости получает список ящиков
+    из журнала аудита и запускает параллельную обработку удаления.
+    
+    Args:
+        settings: Объект настроек приложения
+        use_log: Использовать журнал аудита для определения ящиков (по умолчанию True)
+        
+    Returns:
+        SettingParams: Обновленный объект настроек
+    """
     stop_running = False
     if not settings.search_param["message_id"]:
         logger.error("ID сообщения пустой.")
@@ -4982,7 +6540,7 @@ def delete_messages(settings: SettingParams, use_log=True):
         logger.error(f"Для сообщения ID: {settings.search_param['message_id']} не найдено ни одного ящика из журнала аудита.")
         input("Нажмите Enter для продолжения...")
         return settings
-    
+
     # Создаем checkpoint файлы перед началом обработки
     checkpoint_files = create_checkpoint_file(settings.check_dir)
     if checkpoint_files:
@@ -5016,9 +6574,9 @@ def delete_messages(settings: SettingParams, use_log=True):
                     "days_diff": settings.search_param["days_diff"]
                 }
             ],
-            "app_password": settings.delegate_password,
             "org_domain": settings.delegate_domain
         }
+     
         mailboxes_data.append(mailbox_data)
     
     # Вызов параллельной обработки
@@ -5027,7 +6585,7 @@ def delete_messages(settings: SettingParams, use_log=True):
         settings,
         checkin_file,
         checkout_file,
-        report_file
+        report_file,
     ))
     
     # Логирование результатов
@@ -5037,38 +6595,85 @@ def delete_messages(settings: SettingParams, use_log=True):
         else:
             logger.info(f"Результат для ящика {mailboxes_data[i]['delegated_mailbox_alias']}: {result.get('message', 'No message')}")
     
-    # Сравниваем checkpoint файлы перед выводом финального отчета
-    if checkin_file and checkout_file:
-        logger.info("Выполняется сравнение checkpoint файлов...")
-        diff_file, missing_lines = compare_checkpoint_files(checkin_file, checkout_file, settings.check_dir)
-        
-        if diff_file:
-            logger.info(f"Файл с различиями создан: {diff_file}")
-            logger.info(f"Количество строк с различиями: {len(missing_lines)}")
+    if settings.run_mode in ["delegate", "hybrid"]:
+        # Сравниваем checkpoint файлы перед выводом финального отчета
+        if checkin_file and checkout_file:
+            logger.info("Выполняется сравнение checkpoint файлов...")
+            diff_file, missing_lines = compare_checkpoint_files(checkin_file, checkout_file, settings.check_dir)
             
-            # Если есть различия, пытаемся восстановить разрешения
-            if missing_lines:
-                logger.warning("Обнаружены несоответствия между исходным и финальным состоянием разрешений!")
-                logger.warning("Начинается восстановление разрешений к исходному состоянию...")
+            if diff_file:
+                logger.info(f"Файл с различиями создан: {diff_file}")
+                logger.info(f"Количество строк с различиями: {len(missing_lines)}")
                 
-                # Получаем список пользователей один раз для всех операций восстановления
-                all_users = get_all_api360_users(settings, force=False)
-                
-                # Выполняем восстановление разрешений
-                restore_stats = restore_permissions_from_diff(missing_lines, settings, all_users)
-                
-                # Логируем результаты восстановления
-                if restore_stats["errors"] == 0:
-                    logger.info("✓ Все разрешения успешно восстановлены к исходному состоянию")
-                else:
-                    logger.warning(f"⚠ Восстановление завершено с ошибками: {restore_stats['errors']} из {restore_stats['total']}")
-                    logger.warning("Проверьте логи для получения подробной информации об ошибках")
+                # Если есть различия, пытаемся восстановить разрешения
+                if missing_lines:
+                    logger.warning("Обнаружены несоответствия между исходным и финальным состоянием разрешений!")
+                    logger.warning("Начинается восстановление разрешений к исходному состоянию...")
+                    
+                    # Получаем список пользователей один раз для всех операций восстановления
+                    all_users = get_all_api360_users(settings, force=False)
+                    
+                    # Выполняем восстановление разрешений
+                    restore_stats = restore_permissions_from_diff(missing_lines, settings, all_users)
+                    
+                    # Логируем результаты восстановления
+                    if restore_stats["errors"] == 0:
+                        logger.info("✓ Все разрешения успешно восстановлены к исходному состоянию")
+                    else:
+                        logger.warning(f"⚠ Восстановление завершено с ошибками: {restore_stats['errors']} из {restore_stats['total']}")
+                        logger.warning("Проверьте логи для получения подробной информации об ошибках")
     
     # Выводим финальный отчет
     print_final_report(settings.search_param["message_id"], mailboxes_data, results)
 
     return settings
+
+def get_service_app_token(settings: "SettingParams", user_email: str) -> str:
+    """
+    Получает IMAP-токен для пользователя через сервисное приложение.
     
+    Использует механизм Token Exchange для получения OAuth-токена,
+    который можно использовать для IMAP-авторизации через XOAUTH2.
+    
+    Args:
+        settings: Объект настроек с application_client_id и application_client_secret
+        user_email: Email пользователя для получения токена
+        
+    Returns:
+        str: OAuth-токен для IMAP-авторизации
+        
+    Raises:
+        TokenError: При ошибке получения токена
+    """
+
+    logger.debug(f"Getting user token for {user_email}")
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "client_id": settings.application_client_id,
+        "client_secret": settings.application_client_secret,
+        "subject_token": user_email,
+        "subject_token_type": "urn:yandex:params:oauth:token-type:email",
+    }
+
+    try:
+        with httpx.Client(headers=headers) as client:
+            response = client.post(url=DEFAULT_OAUTH_API_URL, data=data)
+    except httpx.HTTPError as exc:
+        raise TokenError(f"Failed to request token: {exc}") from exc
+
+    if response.status_code != HTTPStatus.OK.value:
+        raise TokenError(
+            f"Token request failed for {user_email}: {response.status_code} {response.text}"
+        )
+
+    payload = response.json()
+    access_token = payload.get("access_token")
+    if not access_token:
+        raise TokenError(f"No access_token in response for {user_email}: {payload}")
+    return access_token
 
 
 if __name__ == "__main__":
@@ -5095,7 +6700,12 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("\nCtrl+C нажата. До свидания!")
         sys.exit(EXIT_CODE)
-    except Exception as e:
-        logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno}: {e}")
+    except Exception as exc:
+        tb = traceback.extract_tb(exc.__traceback__)
+        last_frame = tb[-1] if tb else None
+        if last_frame:
+            logger.error(f"{type(exc).__name__} at {last_frame.filename}:{last_frame.lineno} in {last_frame.name}: {exc}")
+        else:
+            logger.error(f"{type(exc).__name__}: {exc}")
         sys.exit(EXIT_CODE)
 
