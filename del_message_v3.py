@@ -4063,7 +4063,7 @@ def get_settings():
             logger.error("DELEGATE_PASSWORD не установлен")
             exit_flag = True
 
-    if settings.run_mode == "service_application":
+    if settings.run_mode in ["service_application","hybrid"]:
         # Проверка параметров сервисного приложения
         if not settings.application_client_id:
             logger.error("APPLICATION_CLIENT_ID не установлен")
@@ -4104,16 +4104,15 @@ def get_settings():
             logger.error(f"  - DELEGATE_PASSWORD: {'*' * len(settings.delegate_password) if settings.delegate_password else '(не задан)'} (пароль делегата)")
             logger.error("=" * 80)
             return None
+        else:
+            logger.info("=" * 80)
+            logger.info("✓ IMAP подключение делегата успешно проверено.")
+            logger.info("=" * 80)
 
     if settings.run_mode in ["service_application", "hybrid"]:
         check_service_app_status(settings, skip_permissions_check=True)
         if not settings.service_app_status:
             logger.error("Сервисное приложение не настроено. Настройте сервисное приложение через меню настроек.")
-
-    
-    logger.info("=" * 80)
-    logger.info("✓ IMAP подключение делегата успешно проверено.")
-    logger.info("=" * 80)
     
     return settings
 
