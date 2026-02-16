@@ -73,7 +73,7 @@ SERVICE_APP_PERMISSIONS = [
     "mail:imap_full",
 ]
 # Логирование
-logger = logging.getLogger("get_audit_log")
+logger = logging.getLogger("delete_messages")
 logger.setLevel(logging.DEBUG)
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
