@@ -5898,7 +5898,7 @@ def find_users_prompt(settings: "SettingParams", answer = "") -> tuple[list[dict
         
         #rus_pattern = re.compile('[-А-Яа-яЁё]+')
         #anti_rus_pattern = r'[^\u0400-\u04FF\s]'
-
+        
         for searched in search_users:
             if "@" in searched.strip():
                 searched = searched.split("@")[0]
@@ -5909,7 +5909,7 @@ def find_users_prompt(settings: "SettingParams", answer = "") -> tuple[list[dict
                     for user in users:
                         if user['id'] == searched.strip():
                             logger.debug(f"User found: {user['nickname']} ({user['id']})")
-                            users_to_add.append(user)
+                            users_to_add.append({'email': user['email'], 'shared': False})
                             found_flag = True
                             break
 
@@ -5919,7 +5919,7 @@ def find_users_prompt(settings: "SettingParams", answer = "") -> tuple[list[dict
                     aliases_lower_case = [r.lower() for r in user['aliases']]
                     if user['nickname'].lower() == searched.lower().strip() or searched.lower().strip() in aliases_lower_case:
                         logger.debug(f"Ящик найден: {user['nickname']} ({user['id']})")
-                        users_to_add.append(user)
+                        users_to_add.append({'email': user['email'], 'shared': False})
                         found_flag = True
                         break
                     if user['name']['last'].lower() == searched.lower().strip():
@@ -5927,7 +5927,7 @@ def find_users_prompt(settings: "SettingParams", answer = "") -> tuple[list[dict
                 if not found_flag and found_last_name_user:
                     if len(found_last_name_user) == 1:
                         logger.debug(f"Ящик найден ({searched}): {found_last_name_user[0]['nickname']} ({found_last_name_user[0]['id']}, {found_last_name_user[0]['position']})")
-                        users_to_add.append(found_last_name_user[0])
+                        users_to_add.append({'email': found_last_name_user[0]['email'], 'shared': False})
                         found_flag = True
                     else:
                         logger.error(f"Ящик {searched} найден более одного раза в организации")
