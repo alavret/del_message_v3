@@ -28,7 +28,7 @@ DEFAULT_IMAP_SERVER = "imap.yandex.ru"
 DEFAULT_IMAP_PORT = 993
 DEFAULT_360_API_URL = "https://api360.yandex.net"
 DEFAULT_OAUTH_API_URL = "https://oauth.yandex.ru/token"
-LOG_FILE = "imap_helper.log"
+LOG_FILE = "del_message_v3.log"
 DEFAULT_DAYS_DIF = 1
 FILTERED_EVENTS = ["message_receive"]
 FILTERED_MAILBOXES = []
@@ -4940,13 +4940,14 @@ def fetch_audit_logs(settings: "SettingParams"):
     Returns:
         tuple: (error: bool, records: list) - флаг ошибки и список записей аудит-лога
     """
+    fmt = '%Y-%m-%dT%H:%M:%S.%fZ'
     log_records = set()
     params = {}
     error = False
     msg_date = datetime.strptime(settings.search_param["message_date"], "%d-%m-%Y")
 
     initial_after_date =  msg_date + relativedelta(days = -settings.search_param["days_diff"], hour = 0, minute = 0, second = 0) 
-    initial_before_date = msg_date + relativedelta(days = settings.search_param["days_diff"]+1, hour = 0, minute = 0, second = 0)
+    initial_before_date = msg_date + relativedelta(days = settings.search_param["days_diff"]+1, hour = 23, minute = 59, second = 59)
     logger.info(f"Поиск данных с {initial_after_date.strftime('%Y-%m-%d')} по {initial_before_date.strftime('%Y-%m-%d')}.")
     ended_at = initial_before_date.strftime("%Y-%m-%dT%H:%M:%SZ")
     last_date = initial_after_date.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4955,9 +4956,7 @@ def fetch_audit_logs(settings: "SettingParams"):
         if last_date:
             params["afterDate"] = last_date
         if ended_at:
-            msg_date = datetime.strptime(ended_at, "%Y-%m-%dT%H:%M:%SZ")
-            shifted_date = msg_date + relativedelta(seconds=OVERLAPPED_SECONDS)
-            params["beforeDate"] = shifted_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+            params["beforeDate"] = ended_at
         url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/audit_log/mail"
         headers = {"Authorization": f"OAuth {settings.oauth_token}"}
         pages_count = 0
@@ -4976,12 +4975,12 @@ def fetch_audit_logs(settings: "SettingParams"):
                     else:
                         logger.error("Принудительный выход без получения данных.")
                         error = True
-                        return []
+                        return error, []
                 else:
                     retries = 1
                     temp_list = response.json()["events"]
                     if not temp_list:
-                        logger.error("GET запрос вернул пустой ответ. Выход из цикла сбора журнала.")
+                        logger.info("Запрос вернул пустой список событий. Выход из цикла сбора записей логов аудита почты.")
                         break
                     sorted_list = sorted(temp_list, key=lambda x: x["date"], reverse=True)
                     if temp_list:
@@ -4997,23 +4996,26 @@ def fetch_audit_logs(settings: "SettingParams"):
                             params["pageToken"] = response.json()["nextPageToken"]
                         else:
                             if params.get('pageToken') : del params['pageToken']
-                            if temp_list:
-                                sugested_date = sorted_list[-1]["date"][0:19] + "Z"
-                                msg_date = datetime.strptime(sugested_date, "%Y-%m-%dT%H:%M:%SZ")
-                                shifted_date = msg_date + relativedelta(seconds=OVERLAPPED_SECONDS)
-                                params["beforeDate"] = shifted_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                            occurred_at_raw = sorted_list[-1]["date"]
+                            match = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)", occurred_at_raw)
+                            if match:
+                                suggested_date = match.group(1)
                             else:
-                                logger.error("API запрос вернул пустой ответ. Выход из цикла.")
-                                logger.debug(f"Данные для GET запроса: url - {url}. Параметры - {params}")
-                                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
-                                break
+                                logger.warning(f"Could not parse occurred_at field: {occurred_at_raw}")
+                                suggested_date = occurred_at_raw[:19]  # fallback, though не гарантия что корректно
+
+                            suggested_date = f'{suggested_date}Z'
+                            msg_date = datetime.strptime(suggested_date, fmt) + relativedelta(microsecon=-1000)
+                            params["beforeDate"] = msg_date.strftime(fmt)
+
                             params["pageSize"] = 100
                             pages_count = 0
 
     except Exception as e:
         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
         error = True
-        return []
+        return error,[]
         
     parsed_records = []
     for item in log_records:
@@ -5694,7 +5696,8 @@ def set_message_id(settings: SettingParams):
     Returns:
         SettingParams: Обновленный объект настроек с message_id
     """
-    answer = input("Введите ID сообщения и дату сообщения, разделенные пробелом (ПРОБЕЛ для очистки): ")
+    print("Введите ID сообщения и дату сообщения, разделенные пробелом (ПРОБЕЛ для очистки)")
+    answer = input("ID сообщения и дата: ")
     if answer:
         if answer.strip() == "":
             settings.search_param["message_id"] = ""
@@ -5753,7 +5756,7 @@ def set_days_diff(settings: SettingParams):
             if int(answer) > 0 and int(answer) < 90:
                 settings.search_param["days_diff"] = int(answer.replace(" ", "").strip())
             else:
-                print("Неверное количество дней назад (максимум 90 дней). Попробуйте снова.")
+                print("Неверное количество дней назад (максимум 89 дней). Попробуйте снова.")
         else:
             print("Неверное количество дней назад. Попробуйте снова.")
         
